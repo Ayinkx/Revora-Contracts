@@ -9338,11 +9338,20 @@ impl RevoraRevenueShare {
         }
 
         let now = env.ledger().timestamp();
-        let last_request_ts: Option<u64> = env.storage().persistent().get(&DataKey2::FaucetLastRequest(requester.clone()));
+        let last_request_ts: Option<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::FaucetLastRequest(requester.clone()));
         if let Some(last_ts) = last_request_ts {
             if now.saturating_sub(last_ts) < DEFAULT_FAUCET_COOLDOWN_SECONDS {
                 env.events().publish(
-                    (EVENT_FAUCET_COOLDOWN_REJECT, requester.clone(), issuer.clone(), namespace.clone(), token.clone()),
+                    (
+                        EVENT_FAUCET_COOLDOWN_REJECT,
+                        requester.clone(),
+                        issuer.clone(),
+                        namespace.clone(),
+                        token.clone(),
+                    ),
                     (last_ts, now, DEFAULT_FAUCET_COOLDOWN_SECONDS),
                 );
                 return Err(RevoraError::FaucetCooldownActive);
@@ -9351,7 +9360,7 @@ impl RevoraRevenueShare {
 
         env.storage()
             .persistent()
-            .set(&DataKey2::FaucetLastRequest(requester.clone()), &now);
+            .set(&DataKey2::FaucetLastRequest(requester), &now);
 
         if count == 0 {
             return Ok(Vec::new(&env));

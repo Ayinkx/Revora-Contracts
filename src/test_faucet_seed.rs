@@ -124,7 +124,11 @@ fn faucet_rejects_requests_within_the_cooldown_window() {
     assert!(matches!(first, Ok(Ok(_))));
 
     let second = client.try_faucet_seed_holders(&requester, &issuer, &ns, &token, &2);
-    assert_eq!(second, Err(Ok(RevoraError::FaucetCooldownActive)));
+    assert_eq!(
+        second,
+        Err(Ok(RevoraError::FaucetCooldownActive)),
+        "second request within cooldown should be rejected"
+    );
 }
 
 #[test]
@@ -142,7 +146,10 @@ fn faucet_allows_request_after_cooldown_elapsed() {
     env.ledger().set_timestamp(DEFAULT_FAUCET_COOLDOWN_SECONDS);
 
     let second = client.try_faucet_seed_holders(&requester, &issuer, &ns, &token, &2);
-    assert!(matches!(second, Ok(Ok(_))));
+    assert!(
+        matches!(second, Ok(Ok(_))),
+        "request after cooldown elapsed should succeed"
+    );
 }
 
 // ── Edge-case: count == 0 ──────────────────────────────────────────────────────
