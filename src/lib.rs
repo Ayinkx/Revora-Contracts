@@ -1412,10 +1412,7 @@ impl RevoraRevenueShare {
         env.storage()
             .persistent()
             .set(&DataKey::OfferingRoyaltyBps(offering_id, asset.clone()), &royalty_bps);
-        env.events().publish(
-            (EVENT_ROYALTY_CONFIG, issuer, namespace, token, asset),
-            royalty_bps,
-        );
+        env.events().publish((EVENT_ROYALTY_CONFIG, issuer, namespace, token, asset), royalty_bps);
         Ok(())
     }
 
@@ -1471,9 +1468,8 @@ impl RevoraRevenueShare {
             token.clone(),
             payment_asset.clone(),
         );
-        let royalty_amount = (amount * royalty_bps as i128)
-            .checked_div(BPS_DENOMINATOR)
-            .unwrap_or(0);
+        let royalty_amount =
+            (amount * royalty_bps as i128).checked_div(BPS_DENOMINATOR).unwrap_or(0);
 
         if royalty_amount > 0 {
             if token::Client::new(&env, &payment_asset)
@@ -1486,21 +1482,11 @@ impl RevoraRevenueShare {
 
         Self::emit_v2_event(
             &env,
-            (
-                EVENT_ROYALTY_PAID,
-                issuer.clone(),
-                namespace.clone(),
-                token.clone(),
-            ),
+            (EVENT_ROYALTY_PAID, issuer.clone(), namespace.clone(), token.clone()),
             (payer.clone(), seller, buyer, payment_asset, amount, royalty_amount),
         );
         env.events().publish(
-            (
-                EVENT_ROYALTY_PAID,
-                issuer,
-                namespace,
-                token,
-            ),
+            (EVENT_ROYALTY_PAID, issuer, namespace, token),
             (payer, seller, buyer, payment_asset, amount, royalty_amount),
         );
 
