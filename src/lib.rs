@@ -156,6 +156,13 @@ pub enum RevoraError {
     AlreadyAtTargetVersion = 32,
     /// Target version is lower than the current deployed version.
     MigrationDowngradeNotAllowed = 33,
+
+    /// Close-period abort due to a detected accrual or share ledger invariant violation.
+    ///
+    /// This error is returned before the period is sealed to prevent partially committed
+    /// close actions when the underlying state is inconsistent.
+    CloseAbortInvariantsViolated = 34,
+
     /// Admin rotation failed: new admin cannot be the same as current.
     AdminRotationSameAddress = 40,
     /// Admin rotation failed: another rotation is already pending.
@@ -7817,12 +7824,40 @@ impl RevoraRevenueShare {
             return Err(RevoraError::PeriodAlreadyClosed);
         }
 
+        Self::assert_close_period_invariants(&env, &offering_id)?;
+
         let closed_at = env.ledger().timestamp();
         env.storage().persistent().set(&closed_key, &closed_at);
 
         env.events()
             .publish((EVENT_PERIOD_CLOSED, issuer, namespace, token), (period_id, closed_at));
 
+        Ok(())
+    }
+
+    fn assert_close_period_invariants(
+        env: &Env,
+        offering_id: &OfferingId,
+    ) -> Result<(), RevoraError> {
+        let total_share_bps: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::HolderShareTotal(offering_id.clone()))
+            .unwrap_or(0);
+
+        let total_shares_issued: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::TotalSharesIssued(offering_id.clone()))
+            .unwrap_or(0);
+
+        if total_share_bps > 10_000
+            || total_shares_issued < 0
+            || total_shares_issued > 10_000
+            || total_share_bps as i128 != total_shares_issued
+        {
+            return Err(RevoraError::CloseAbortInvariantsViolated);
+        }
         Ok(())
     }
 
