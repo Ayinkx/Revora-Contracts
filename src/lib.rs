@@ -7465,9 +7465,7 @@ impl RevoraRevenueShare {
     ///
     /// # Events
 
-    /// Return unclaimed period IDs for a holder on an offering.
-    /// Ordering: by deposit index (creation order), deterministic (#38).
-    pub fn get_pending_periods(
+    /// Claim pending share payouts for a holder on an offering.
     pub fn claim(
         env: Env,
         holder: Address,
