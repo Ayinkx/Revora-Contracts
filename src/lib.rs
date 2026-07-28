@@ -355,6 +355,8 @@ const EVENT_SUPPLY_CAP_REACHED: Symbol = symbol_short!("cap_reach");
 const EVENT_INV_CONSTRAINTS: Symbol = symbol_short!("inv_cfg");
 /// Emitted when per-offering or platform per-asset fee is set (#98).
 const EVENT_FEE_CONFIG: Symbol = symbol_short!("fee_cfg");
+const EVENT_ROYALTY_CONFIG: Symbol = symbol_short!("roy_cfg");
+const EVENT_ROYALTY_PAID: Symbol = symbol_short!("roy_paid");
 const EVENT_INDEXED_V2: Symbol = symbol_short!("ev_idx2");
 const EVENT_INDEXED_V3: Symbol = symbol_short!("ev_idx3");
 const EVENT_TYPE_OFFER: Symbol = symbol_short!("offer");
@@ -1016,6 +1018,8 @@ pub(crate) enum DataKey {
     PlatformFeeBps,
     /// Per-offering per-asset fee override (#98).
     OfferingFeeBps(OfferingId, Address),
+    /// Per-offering per-asset secondary-market royalty override (#562).
+    OfferingRoyaltyBps(OfferingId, Address),
     /// Platform level per-asset fee (#98).
     PlatformFeePerAsset(Address),
     /// Whether snapshot finalization is enforced globally.
@@ -1517,6 +1521,20 @@ impl RevoraRevenueShare {
         }
         // 3. Global platform fee
         env.storage().persistent().get::<DataKey, u32>(&DataKey::PlatformFeeBps).unwrap_or(0)
+    }
+
+    fn get_secondary_market_royalty_bps(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        asset: Address,
+    ) -> u32 {
+        let offering_id = OfferingId { issuer, namespace, token };
+        env.storage()
+            .persistent()
+            .get::<DataKey, u32>(&DataKey::OfferingRoyaltyBps(offering_id, asset))
+            .unwrap_or(0)
     }
 
     /// Helper to emit deterministic v2 versioned events for core event versioning.
@@ -2376,6 +2394,134 @@ impl RevoraRevenueShare {
     ) -> u32 {
         let offering_id = OfferingId { issuer, namespace, token };
         env.storage().persistent().get(&DataKey::OfferingFeeBps(offering_id, asset)).unwrap_or(0)
+    }
+
+    /// Set a per-offering per-asset secondary-market royalty in basis points. Issuer-only. (#562)
+    ///
+    /// Emits `EVENT_ROYALTY_CONFIG` with `(issuer, namespace, token, asset, royalty_bps)`.
+    ///
+    /// ### Errors
+    /// - `OfferingNotFound` — offering does not exist or caller is not the issuer.
+    /// - `InvalidRevenueShareBps` — `royalty_bps` exceeds `MAX_PLATFORM_FEE_BPS` (5 000).
+    pub fn set_secondary_market_royalty_bps(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        asset: Address,
+        royalty_bps: u32,
+    ) -> Result<(), RevoraError> {
+        let current_issuer =
+            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
+                .ok_or(RevoraError::OfferingNotFound)?;
+        if current_issuer != issuer {
+            return Err(RevoraError::OfferingNotFound);
+        }
+        issuer.require_auth();
+        if royalty_bps > MAX_PLATFORM_FEE_BPS {
+            return Err(RevoraError::InvalidRevenueShareBps);
+        }
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::OfferingRoyaltyBps(offering_id, asset.clone()), &royalty_bps);
+        env.events().publish(
+            (EVENT_ROYALTY_CONFIG, issuer, namespace, token, asset),
+            royalty_bps,
+        );
+        Ok(())
+    }
+
+    /// Return the per-offering per-asset secondary-market royalty in basis points.
+    /// 0 means no royalty is configured.
+    pub fn get_secondary_market_royalty_bps(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        asset: Address,
+    ) -> u32 {
+        let offering_id = OfferingId { issuer, namespace, token };
+        env.storage()
+            .persistent()
+            .get(&DataKey::OfferingRoyaltyBps(offering_id, asset))
+            .unwrap_or(0)
+    }
+
+    /// Pay a configured secondary-market royalty on a transfer.
+    ///
+    /// The royalty amount is routed to the issuer and is computed as
+    /// `amount * royalty_bps / BPS_DENOMINATOR`.
+    ///
+    /// ### Errors
+    /// - `OfferingNotFound` — offering does not exist.
+    /// - `InvalidAmount` — transfer amount is not positive.
+    /// - `TransferFailed` — token transfer to issuer failed.
+    pub fn pay_secondary_market_royalty(
+        env: Env,
+        payer: Address,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        payment_asset: Address,
+        amount: i128,
+        seller: Address,
+        buyer: Address,
+    ) -> Result<i128, RevoraError> {
+        if amount <= 0 {
+            return Err(RevoraError::InvalidAmount);
+        }
+
+        let current_issuer =
+            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
+                .ok_or(RevoraError::OfferingNotFound)?;
+        payer.require_auth();
+
+        let royalty_bps = Self::get_secondary_market_royalty_bps(
+            env.clone(),
+            issuer.clone(),
+            namespace.clone(),
+            token.clone(),
+            payment_asset.clone(),
+        );
+        let royalty_amount = (amount * royalty_bps as i128)
+            .checked_div(BPS_DENOMINATOR)
+            .unwrap_or(0);
+
+        if royalty_amount > 0 {
+            if token::Client::new(&env, &payment_asset)
+                .try_transfer(&payer, &current_issuer, &royalty_amount)
+                .is_err()
+            {
+                return Err(RevoraError::TransferFailed);
+            }
+        }
+
+        Self::emit_v2_event(
+            &env,
+            (
+                EVENT_ROYALTY_PAID,
+                issuer.clone(),
+                namespace.clone(),
+                token.clone(),
+            ),
+            (payer.clone(), seller, buyer, payment_asset, amount, royalty_amount),
+        );
+        env.events().publish(
+            (
+                EVENT_ROYALTY_PAID,
+                issuer,
+                namespace,
+                token,
+            ),
+            (payer, seller, buyer, payment_asset, amount, royalty_amount),
+        );
+
+        Ok(royalty_amount)
     }
 
     /// Set a platform-level per-asset fee in basis points. Admin-only. (#98)
