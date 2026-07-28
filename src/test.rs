@@ -8885,6 +8885,135 @@ mod regression {
         );
     }
 
+    #[test]
+    fn set_secondary_market_royalty_bps_stores_and_retrieves() {
+        let env = Env::default();
+        let (client, issuer, token, payout_asset) = setup_fee_offering(&env);
+        client.set_secondary_market_royalty_bps(
+            &issuer,
+            &symbol_short!("fee"),
+            &token,
+            &payout_asset,
+            &200,
+        );
+        assert_eq!(
+            client.get_secondary_market_royalty_bps(&issuer, &symbol_short!("fee"), &token, &payout_asset),
+            200,
+        );
+    }
+
+    #[test]
+    fn set_secondary_market_royalty_bps_above_maximum_fails() {
+        let env = Env::default();
+        let (client, issuer, token, payout_asset) = setup_fee_offering(&env);
+        let result = client.try_set_secondary_market_royalty_bps(
+            &issuer,
+            &symbol_short!("fee"),
+            &token,
+            &payout_asset,
+            &5_001,
+        );
+        assert!(result.is_err(), "royalty_bps > MAX_PLATFORM_FEE_BPS (5 000) must be rejected");
+    }
+
+    #[test]
+    fn set_secondary_market_royalty_bps_fails_for_nonexistent_offering() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RevoraRevenueShare);
+        let client = RevoraRevenueShareClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+        let asset = Address::generate(&env);
+        client.initialize(&admin, &None::<Address>, &None::<bool>);
+        let result = client.try_set_secondary_market_royalty_bps(
+            &admin,
+            &symbol_short!("fee"),
+            &token,
+            &asset,
+            &100,
+        );
+        assert!(result.is_err(), "must fail when offering does not exist");
+    }
+
+    #[test]
+    fn pay_secondary_market_royalty_transfers_to_issuer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RevoraRevenueShare);
+        let client = RevoraRevenueShareClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let issuer = admin.clone();
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token = Address::generate(&env);
+        let payout_asset = Address::generate(&env);
+
+        client.initialize(&admin, &None::<Address>, &None::<bool>);
+        client.register_offering(&issuer, &symbol_short!("fee"), &token, &1_000, &payout_asset, &0);
+        client.set_secondary_market_royalty_bps(&issuer, &symbol_short!("fee"), &token, &payout_asset, &250);
+
+        let payment_asset = crate::test_utils::create_token(&env, &admin);
+        crate::test_utils::mint_tokens(&env, &payment_asset, &buyer, 1_000);
+
+        let royalty_amount = client
+            .pay_secondary_market_royalty(
+                &buyer,
+                &issuer,
+                &symbol_short!("fee"),
+                &token,
+                &payment_asset,
+                &400,
+                &seller,
+                &buyer,
+            )
+            .unwrap();
+
+        assert_eq!(royalty_amount, 10); // 400 * 2.5%
+        assert_eq!(
+            crate::test_utils::get_balance(&env, &payment_asset, &issuer),
+            10,
+        );
+        assert_eq!(crate::test_utils::get_balance(&env, &payment_asset, &buyer), 990);
+    }
+
+    #[test]
+    fn pay_secondary_market_royalty_zero_when_not_configured() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RevoraRevenueShare);
+        let client = RevoraRevenueShareClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let issuer = admin.clone();
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token = Address::generate(&env);
+        let payout_asset = Address::generate(&env);
+
+        client.initialize(&admin, &None::<Address>, &None::<bool>);
+        client.register_offering(&issuer, &symbol_short!("fee"), &token, &1_000, &payout_asset, &0);
+
+        let payment_asset = crate::test_utils::create_token(&env, &admin);
+        crate::test_utils::mint_tokens(&env, &payment_asset, &buyer, 1_000);
+
+        let royalty_amount = client
+            .pay_secondary_market_royalty(
+                &buyer,
+                &issuer,
+                &symbol_short!("fee"),
+                &token,
+                &payment_asset,
+                &400,
+                &seller,
+                &buyer,
+            )
+            .unwrap();
+
+        assert_eq!(royalty_amount, 0);
+        assert_eq!(crate::test_utils::get_balance(&env, &payment_asset, &issuer), 0);
+        assert_eq!(crate::test_utils::get_balance(&env, &payment_asset, &buyer), 1_000);
+    }
+
     // ── Platform-level per-asset fee ─────────────────────────────────────────
 
     #[test]
