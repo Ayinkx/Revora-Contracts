@@ -16,7 +16,7 @@ deposit processing or `get_payment_token` reads.
 
 ## Behavior
 
-- `get_payment_token` returns `None` before the first successful deposit.
+- `get_payment_token` returns `None` if the offering is unknown or if the offering exists but has not yet recorded a successful deposit.
 - The first successful deposit writes `PaymentToken = payment_token`.
 - Subsequent deposits must use that exact token or fail with
   `RevoraError::PaymentTokenMismatch`.

@@ -35,7 +35,7 @@
 
 use soroban_sdk::{symbol_short, testutils::Address as _, Address, Env, IntoVal, Symbol};
 
-use crate::{RevoraRevenueShare, RevoraRevenueShareClient};
+use crate::{RevoraError, RevoraRevenueShare, RevoraRevenueShareClient};
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -51,7 +51,7 @@ fn setup_offering(env: &Env, client: &RevoraRevenueShareClient) -> (Address, Add
     let token = Address::generate(env);
     let payout = Address::generate(env);
     client.set_admin(&issuer);
-    client.register_offering(&issuer, &symbol_short!("def"), &token, &1_000u32, &payout, &0i128);
+    client.register_offering(&issuer, &symbol_short!("def"), &token, &1_000u32, &payout, &0i128, &symbol_short!(""), &0);
     (issuer, token, payout)
 }
 
@@ -244,7 +244,7 @@ fn milestone_concentration_enforcement_blocks_revenue_report() {
     let (issuer, token, payout) = setup_offering(&env, &client);
     let ns = symbol_short!("def");
 
-    client.set_concentration_limit(&issuer, &ns, &token, &5_000u32, &true);
+    client.set_concentration_limit(&issuer, &ns, &token, &5_000u32, &true, &0u64);
     client.report_concentration(&issuer, &ns, &token, &6_000u32);
 
     assert!(
@@ -267,7 +267,7 @@ fn milestone_concentration_at_limit_allows_revenue_report() {
     let (issuer, token, payout) = setup_offering(&env, &client);
     let ns = symbol_short!("def");
 
-    client.set_concentration_limit(&issuer, &ns, &token, &5_000u32, &true);
+    client.set_concentration_limit(&issuer, &ns, &token, &5_000u32, &true, &0u64);
     client.report_concentration(&issuer, &ns, &token, &5_000u32);
 
     client.report_revenue(&issuer, &ns, &token, &payout, &1_000i128, &1u64, &false);
@@ -283,7 +283,7 @@ fn milestone_concentration_warning_does_not_block_report() {
     let (issuer, token, payout) = setup_offering(&env, &client);
     let ns = symbol_short!("def");
 
-    client.set_concentration_limit(&issuer, &ns, &token, &3_000u32, &false);
+    client.set_concentration_limit(&issuer, &ns, &token, &3_000u32, &false, &0u64);
     client.report_concentration(&issuer, &ns, &token, &8_000u32);
 
     client.report_revenue(&issuer, &ns, &token, &payout, &500i128, &1u64, &false);
@@ -303,12 +303,51 @@ fn milestone_concentration_warning_event_emitted() {
     let (issuer, token, _payout) = setup_offering(&env, &client);
     let ns = symbol_short!("def");
 
-    client.set_concentration_limit(&issuer, &ns, &token, &3_000u32, &false);
+    client.set_concentration_limit(&issuer, &ns, &token, &3_000u32, &false, &0u64);
     client.report_concentration(&issuer, &ns, &token, &8_000u32);
 
     assert!(
         events_contain(&env, symbol_short!("conc_wrn")),
         "conc_wrn event must be emitted when concentration exceeds limit"
+    );
+}
+
+/// When concentration is exactly one bps over the limit, `report_revenue` is rejected.
+#[test]
+fn milestone_concentration_one_bps_over_limit_rejected() {
+    let env = Env::default();
+    let client = make_client(&env);
+    let (issuer, token, payout) = setup_offering(&env, &client);
+    let ns = symbol_short!("def");
+
+    client.set_concentration_limit(&issuer, &ns, &token, &5_000u32, &true, &0u64);
+    client.report_concentration(&issuer, &ns, &token, &5_001u32);
+
+    let result = client.try_report_revenue(&issuer, &ns, &token, &payout, &1_000i128, &1u64, &false);
+    assert_eq!(result, Err(Ok(RevoraError::ConcentrationLimitExceeded)));
+}
+
+/// When in testnet mode, concentration enforcement is bypassed even if over limit.
+#[test]
+fn milestone_concentration_testnet_mode_bypasses_enforcement() {
+    let env = Env::default();
+    let client = make_client(&env);
+    let (issuer, token, payout) = setup_offering(&env, &client);
+    let ns = symbol_short!("def");
+
+    // Enable testnet mode (requires admin auth)
+    client.set_testnet_mode(&true);
+
+    client.set_concentration_limit(&issuer, &ns, &token, &5_000u32, &true, &0u64);
+    client.report_concentration(&issuer, &ns, &token, &6_000u32);
+
+    // Should succeed despite being over limit
+    client.report_revenue(&issuer, &ns, &token, &payout, &1_000i128, &1u64, &false);
+
+    assert_eq!(
+        client.get_audit_summary(&issuer, &ns, &token).unwrap().report_count,
+        1u64,
+        "testnet mode must bypass concentration enforcement"
     );
 }
 
@@ -430,8 +469,8 @@ fn milestone_audit_summary_isolated_per_offering() {
     let ns = symbol_short!("def");
 
     client.set_admin(&issuer);
-    client.register_offering(&issuer, &ns, &token_a, &1_000u32, &payout, &0i128);
-    client.register_offering(&issuer, &ns, &token_b, &1_000u32, &payout, &0i128);
+    client.register_offering(&issuer, &ns, &token_a, &1_000u32, &payout, &0i128, &symbol_short!(""), &0);
+    client.register_offering(&issuer, &ns, &token_b, &1_000u32, &payout, &0i128, &symbol_short!(""), &0);
 
     client.report_revenue(&issuer, &ns, &token_a, &payout, &5_000i128, &1u64, &false);
 
