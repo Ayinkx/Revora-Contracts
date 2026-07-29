@@ -10796,7 +10796,7 @@ impl RevoraRevenueShare {
         );
 
         let n = holders.len();
-        let mut payouts: Vec<DistributionEntry> = Vec::new(env);
+        let mut payout_rows: std::vec::Vec<(u32, u32, Address, i128)> = std::vec::Vec::new();
         let mut total: i128 = 0;
 
         for i in 0..n {
@@ -10829,8 +10829,19 @@ impl RevoraRevenueShare {
                 Self::compute_share(env.clone(), period_revenue, bounded_bps, mode);
 
             total = total.saturating_add(normalized_payout);
+            payout_rows.push((bounded_bps, share_bps, holder.clone(), normalized_payout));
+        }
+
+        payout_rows.sort_by(|a, b| match b.0.cmp(&a.0) {
+            core::cmp::Ordering::Equal => a.2.cmp(&b.2),
+            other => other,
+        });
+
+        let mut payouts: Vec<DistributionEntry> = Vec::new(env);
+        for (bounded_bps, share_bps, holder, normalized_payout) in payout_rows {
+            let _ = bounded_bps;
             payouts.push_back(DistributionEntry {
-                holder: holder.clone(),
+                holder,
                 share_bps,
                 normalized_payout,
             });
