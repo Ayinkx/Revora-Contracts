@@ -1633,12 +1633,32 @@ pub enum DataKey2 {
     /// Value: `Vec<DeferredQueueEntry>` stored in `(release_ts, priority, queue_id)` sorted order.
     DeferredQueue(OfferingId),
 
-    // ── Regulatory-limit aggregate (reg_limit_delta event stream) ──
-    /// Cumulative aggregate share (BPS) held by all holders in a given jurisdiction
-    /// for (offering_id, jurisdiction). Updated atomically on every issuance and
-    /// transfer so indexers can reconstruct the per-jurisdiction cap-usage history
-    /// from `reg_limit_delta` events without an additional RPC scan.
-    JurisdictionAggregateShare(OfferingId, Symbol),
+    // ── Redemption keys ──
+    /// Pending redemption request for (offering_id, holder).
+    RedemptionRequest(OfferingId, Address),
+    /// Redemption fee configuration for an offering.
+    RedemptionFeeConfig(OfferingId),
+    /// Lockup schedule (cliff/taper) for an offering.
+    LockupSchedule(OfferingId),
+
+    // ── Global / admin keys ──
+    /// Emit v2 compat flag.
+    EmitV2Compat,
+    /// Global freeze reason for the contract.
+    GlobalFreezeReason,
+    /// Admin rotation delay in seconds.
+    AdminRotationDelay,
+
+    // ── Jurisdiction keys ──
+    /// Grace period (seconds) for jurisdiction migration.
+    JurisdictionGracePeriod(OfferingId),
+    /// Jurisdiction migration state for (offering_id, holder).
+    JurisdictionMigration(OfferingId, Address),
+
+    // ── Attestation nonce/expiry (issue #561) ──
+    /// Consumed attestation nonce keyed by (from_address, nonce).
+    /// Prevents attestation replay by tracking used nonces per signer.
+    AttestationNonceUsed(Address, u64),
 }
 
 /// Maximum number of offerings returned in a single page.
@@ -3497,8 +3517,14 @@ impl RevoraRevenueShare {
             }
         }
 
+        // Internal callers without attestation context pass expires_at=0 to
+        // skip attestation nonce/expiry validation. The attest_hash and network_id
+        // are zero-filled since atomic_swap does not require off-chain attestation.
+        let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
+        let net_id = env.ledger().network_id();
         Self::transfer_with_attestation(
             env, issuer, namespace, token, seller, buyer, amount_bps, category,
+            zero_hash, net_id, 0u64, 0u64,
         )?;
 
         Ok(())
@@ -7067,15 +7093,19 @@ impl RevoraRevenueShare {
         from: Address,
         to: Address,
         amount_bps: u32,
+        category: Symbol,
         attest_hash: BytesN<32>,
+        network_id: BytesN<32>,
+        nonce: u64,
+        expires_at: u64,
     ) -> Result<(), RevoraError> {
-        // Guard 1 — global freeze / pause
         Self::require_not_frozen(&env)?;
         Self::require_not_paused(&env)?;
 
-        // Guard 2 — dual-party auth: both the share holder and the issuer must sign.
-        from.require_auth();
-        issuer.require_auth();
+        let active_network_id = env.ledger().network_id();
+        if network_id != active_network_id {
+            return Err(RevoraError::NetworkIdMismatch);
+        }
 
         // Guard 3 — self-transfer is never permitted.
         if from == to {
@@ -7101,10 +7131,58 @@ impl RevoraRevenueShare {
             token: token.clone(),
         };
 
-        // Guard 5 — offering-level freeze.
-        Self::require_not_offering_frozen(&env, &offering_id)?;
+        // Offering-level freeze check
+        if env.storage()
+            .persistent()
+            .get::<DataKey2, bool>(&DataKey2::FrozenOffering(offering_id.clone()))
+            .unwrap_or(false)
+        {
+            return Err(RevoraError::OfferingFrozen);
+        }
 
-        // Guard 6 — blacklist: neither participant may be blacklisted.
+        // Dual-party authorization: both from and to must sign
+        from.require_auth();
+        to.require_auth();
+
+        // Attestation nonce/expiry validation: check but do NOT consume yet.
+        // Consumption happens only after all guards pass (see mark at the end).
+        // When expires_at is 0 (internal callers without attestation context, e.g. atomic_swap)
+        // the nonce/expiry check is skipped.
+        if expires_at > 0 {
+            if env.ledger().timestamp() > expires_at {
+                return Err(RevoraError::SignatureExpired);
+            }
+            let nonce_key = DataKey2::AttestationNonceUsed(from.clone(), nonce);
+            if env.storage().persistent().has(&nonce_key) {
+                return Err(RevoraError::SignatureReplay);
+            }
+        }
+
+        if from == to {
+            return Ok(());
+        }
+
+        // Lockup violation check
+        if let Some(schedule) =
+            Self::get_lockup_schedule(env.clone(), issuer.clone(), namespace.clone(), token.clone())
+        {
+            let now = env.ledger().timestamp();
+            let unlocked_bps = schedule.calculate_unlocked_bps(now);
+            if unlocked_bps < 10_000 {
+                env.events().publish(
+                    (EVENT_LOCKUP_VIOLATION, from.clone()),
+                    (to.clone(), amount_bps, schedule.clone()),
+                );
+                return Err(RevoraError::LockupViolation);
+            }
+        }
+
+        // Zero-value transfer is meaningless
+        if amount_bps == 0 {
+            return Err(RevoraError::InvalidAmount);
+        }
+
+        // Blacklist check
         if Self::is_blacklisted(
             env.clone(),
             issuer.clone(),
@@ -7124,23 +7202,15 @@ impl RevoraRevenueShare {
             return Err(RevoraError::HolderBlacklisted);
         }
 
-        // Guard 7 — whitelist: when the whitelist is non-empty (active), both parties must appear.
-        if Self::is_whitelist_enabled(
-            env.clone(),
-            issuer.clone(),
-            namespace.clone(),
-            token.clone(),
-        ) {
+        // Whitelist enforcement
+        if Self::is_whitelist_enabled(env.clone(), issuer.clone(), namespace.clone(), token.clone()) {
             if !Self::is_whitelisted(
                 env.clone(),
                 issuer.clone(),
                 namespace.clone(),
                 token.clone(),
                 from.clone(),
-            ) {
-                return Err(RevoraError::NotAuthorized);
-            }
-            if !Self::is_whitelisted(
+            ) || !Self::is_whitelisted(
                 env.clone(),
                 issuer.clone(),
                 namespace.clone(),
@@ -7151,14 +7221,16 @@ impl RevoraRevenueShare {
             }
         }
 
-        // Guard 8 — sender must hold at least `amount_bps`.
+        // Jurisdiction block
+        Self::require_holder_jurisdiction_allowed(env.clone(), &offering_id, to.clone(), symbol_short!("xfer"))?;
+
         let from_share: u32 = env
             .storage()
             .persistent()
             .get(&DataKey::HolderShare(offering_id.clone(), from.clone()))
             .unwrap_or(0);
         if from_share < amount_bps {
-            return Err(RevoraError::InvalidShareBps);
+            return Err(RevoraError::InvalidAmount);
         }
 
         // Guard 9 — recipient share cap: `to`'s resulting share must not exceed 10 000 bps.
@@ -7182,7 +7254,18 @@ impl RevoraRevenueShare {
             None,
             None,
         )?;
-        Self::set_holder_share_internal(&env, issuer, namespace, token, to, to_share + amount_bps, None, None)?;
+        Self::set_holder_share_internal(&env, issuer.clone(), namespace.clone(), token.clone(), to, to_share + amount_bps)?;
+
+        // Mark nonce as consumed only after all guards and state mutations succeed.
+        if expires_at > 0 {
+            let nonce_key = DataKey2::AttestationNonceUsed(from.clone(), nonce);
+            env.storage().persistent().set(&nonce_key, &true);
+        }
+
+        env.events().publish(
+            (EVENT_XFER_ATT, issuer, namespace, token),
+            (from, to, amount_bps, attest_hash, nonce, expires_at),
+        );
 
         Ok(())
     }
