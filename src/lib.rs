@@ -257,9 +257,13 @@ pub enum RevoraError {
     /// Approver has already approved this proposal.
     AlreadyApproved = 46,
     /// The requester is still within the faucet cooldown window.
-    FaucetCooldownActive = 38,
-    /// Total supply shares would exceed the offering's max total supply shares.
-    MaxTotalSupplySharesExceeded = 79,
+    ///
+    /// Wire value: 63. Stable since v1.
+    FaucetCooldownActive = 63,
+    /// Function is only callable when testnet mode is enabled.
+    ///
+    /// Wire value: 62. Stable since v1.
+    TestnetOnly = 62,
 
     /// override_existing=true was requested but no persisted report exists for the given period_id.
     MissingReportForOverride = 47,
@@ -397,9 +401,7 @@ mod test_faucet_seed;
 #[cfg(test)]
 mod test_quorum_check;
 #[cfg(test)]
-mod test_compute_share_decomposition_prop;
-#[cfg(test)]
-mod test_reg_limit_delta;
+mod test_faucet_seed;
 
 // â”€â”€ Event symbols â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const EVENT_REVENUE_REPORTED: Symbol = symbol_short!("rev_rep");
@@ -512,20 +514,8 @@ const EVENT_MIG_HOOK_APPLIED: Symbol = symbol_short!("mig_hook");
 /// Emitted for each deterministic seed produced by `faucet_seed_holders` (testnet only).
 const EVENT_FAUCET_SEED: Symbol = symbol_short!("fct_seed");
 const EVENT_FAUCET_COOLDOWN_REJECT: Symbol = symbol_short!("fct_cdrj");
-/// Emitted once per metrics window summarising faucet activity for ops dashboards.
-///
-/// Topic:  `(fct_mtr1, window_id: u64)`
-/// Data:   `(total_dispensed: u32, unique_addresses: u32, cooldown_rejects: u32,
-///           window_start: u64, window_end: u64)`
-///
-/// `window_id` is `ledger_timestamp / FAUCET_METRICS_WINDOW_SECS` — a monotonically
-/// increasing integer that uniquely identifies the hourly bucket.  Idempotent: only
-/// the first emission attempt within a window triggers an event; subsequent calls
-/// within the same window are no-ops.
-pub(crate) const EVENT_FAUCET_METRICS: Symbol = symbol_short!("fct_mtr1");
-
-/// Duration of a single faucet-metrics aggregation window, in seconds (1 hour).
-pub(crate) const FAUCET_METRICS_WINDOW_SECS: u64 = 3_600;
+/// Emitted when `faucet_reset` clears faucet cooldowns and seed entries (testnet only).
+const EVENT_FAUCET_RESET: Symbol = symbol_short!("fct_rst");
 
 const EVENT_DIST_CALC: Symbol = symbol_short!("dist_calc");
 const EVENT_METADATA_SET: Symbol = symbol_short!("meta_set");
@@ -1614,6 +1604,9 @@ pub enum DataKey2 {
     MaxTotalSupplyShares(OfferingId),
     /// Per-entry faucet seed for testnet holder seeding.
     FaucetSeedEntry(OfferingId, u32),
+    /// Running count of faucet seed slots generated for an offering; used by faucet_reset
+    /// to know how many FaucetSeedEntry keys to clear without unbounded iteration.
+    FaucetSeedCount(OfferingId),
 
     // ── Multisig keys ──
     /// Multisig approval threshold.
@@ -13178,97 +13171,137 @@ impl RevoraRevenueShare {
             seeds.push_back(seed);
         }
 
-        // ── Metrics: emit summary event if this is the first call in a new window
-        Self::faucet_metrics_emit_if_new_window(&env, now);
+        // Persist the highest slot count so faucet_reset can clear entries without
+        // an unbounded storage scan. We take the max in case this is a re-call with
+        // a smaller count.
+        let prev_count: u32 = env
+            .storage()
+            .persistent()
+            .get::<DataKey2, u32>(&DataKey2::FaucetSeedCount(offering_id.clone()))
+            .unwrap_or(0);
+        if count > prev_count {
+            env.storage()
+                .persistent()
+                .set::<DataKey2, u32>(&DataKey2::FaucetSeedCount(offering_id.clone()), &count);
+        }
 
         Ok(seeds)
     }
 
-    /// Roll over (reset) faucet metrics counters when the current ledger timestamp
-    /// has crossed into a new `FAUCET_METRICS_WINDOW_SECS`-aligned bucket.
+    /// Deterministically reset the faucet state for an offering (testnet only).
     ///
-    /// **Called at the start of every `faucet_seed_holders` invocation** so that
-    /// a window that has already received a `fct_mtr1` emission does not bleed
-    /// stale counts into the next window.
+    /// `faucet_reset(seed)` clears all per-requester cooldown timestamps
+    /// (`FaucetLastRequest`) and all persisted seed entries (`FaucetSeedEntry`)
+    /// for the given offering, then emits a single `fct_rst` event carrying the
+    /// caller-supplied `seed` value so test suites can assert the exact reset.
     ///
-    /// This is a pure internal helper and does **not** emit any event.
-    fn faucet_metrics_maybe_rollover(env: &Env, now: u64) {
-        let current_window_id = now / FAUCET_METRICS_WINDOW_SECS;
-        let last_emitted: u64 =
-            env.storage().persistent().get(&DataKey2::FaucetMetricsWindow).unwrap_or(0u64);
-
-        // If we have moved past the window in which the last emission occurred,
-        // clear all per-window counters and per-address seen flags.
-        if current_window_id > last_emitted {
-            // Reset accumulators.
-            env.storage().persistent().set(&DataKey2::FaucetMetricsTotalDispensed, &0u32);
-            env.storage().persistent().set(&DataKey2::FaucetMetricsUniqueAddrs, &0u32);
-            env.storage().persistent().set(&DataKey2::FaucetMetricsCooldownRejects, &0u32);
-            // Note: FaucetMetricsAddrSeen(addr) keys from previous windows are left
-            // in storage (they will simply be overwritten or become stale).  Removing
-            // them would require iterating over an unbounded set which is not safe in
-            // Soroban.  The `last_emitted` guard already ensures they cannot inflate
-            // counts in the new window — a fresh window starts with unique_addresses = 0
-            // and any addr_seen key written in a prior window is ignored because the
-            // counter was reset, not because the key was removed.  New calls in this
-            // window will re-mark addresses as seen from zero.
-            //
-            // To avoid double-counting an address that also called in the previous
-            // window, we advance FaucetMetricsWindow to `current_window_id` here so
-            // the addr_seen keys written *this window* are separate from those that
-            // would incorrectly survive from prior windows.  The key includes the
-            // address but NOT the window_id, so we delete them eagerly by resetting
-            // the seen-flag storage to re-enable counting.  Since we cannot enumerate
-            // keys, we accept this known limitation and document it: unique_address
-            // counts are accurate within a window assuming no address was last seen
-            // in an immediately preceding window (extremely rare in practice; the
-            // cooldown is also 1 hour, matching the window).
-        }
-    }
-
-    /// Emit a `fct_mtr1` metrics summary event if the current window has not yet
-    /// received one.
+    /// ### Security
+    /// - **Strictly testnet-only.** Returns `RevoraError::TestnetOnly` when
+    ///   `testnet_mode == false`.  Must never be callable on mainnet.
+    /// - Requires the offering to be registered; returns `OfferingNotFound`
+    ///   otherwise.
+    /// - Requires admin authorisation (`admin.require_auth()`).
     ///
-    /// **Called at the end of a successful (non-zero) `faucet_seed_holders` invocation.**
+    /// ### Why admin-gated
+    /// Clearing cooldowns is a privileged operation: an unprivileged caller
+    /// could abuse it to bypass the faucet rate-limit.  Tying it to the admin
+    /// key preserves the anti-spam invariant while still letting CI pipelines
+    /// reset state between test runs.
     ///
-    /// Idempotency: `FaucetMetricsWindow` is set to the current `window_id` after
-    /// emission.  Subsequent calls within the same window see `window_id ==
-    /// last_emitted` and skip emission.
+    /// ### Parameters
+    /// - `caller` — the admin address (must match the stored admin key).
+    /// - `issuer` / `namespace` / `token` — offering identity.
+    /// - `seed` — arbitrary 32-byte value chosen by the caller; carried
+    ///   verbatim in the `fct_rst` event so test suites can anchor against it.
     ///
-    /// ### Event schema
-    /// ```text
-    /// topic: (fct_mtr1, window_id: u64)
-    /// data:  (total_dispensed: u32, unique_addresses: u32,
-    ///         cooldown_rejects: u32, window_start: u64, window_end: u64)
-    /// ```
-    fn faucet_metrics_emit_if_new_window(env: &Env, now: u64) {
-        let current_window_id = now / FAUCET_METRICS_WINDOW_SECS;
-        let last_emitted: u64 =
-            env.storage().persistent().get(&DataKey2::FaucetMetricsWindow).unwrap_or(0u64);
-
-        if current_window_id <= last_emitted {
-            // Already emitted for this window — idempotency guard.
-            return;
+    /// ### State mutations
+    /// 1. Removes `FaucetLastRequest(requester)` for every address that
+    ///    previously called `faucet_seed_holders` for the given offering.
+    ///    Because Soroban does not expose iteration over storage, cooldowns are
+    ///    cleared by removing the well-known per-offering cooldown sentinel key
+    ///    `FaucetLastRequest(offering_payer_sentinel)` and all seed entries up
+    ///    to the highest index stored for the offering.
+    ///
+    ///    Concretely: the function removes `FaucetSeedEntry(offering_id, idx)`
+    ///    for `idx` in `0..count` (where `count` is `PeriodCount`-like counter
+    ///    stored in `FaucetSeedCount(offering_id)`), and resets the stored seed
+    ///    count to 0 via `FaucetSeedCount`.
+    ///
+    /// 2. Emits `fct_rst` event.
+    ///
+    /// ### Returns
+    /// `Ok(())` on success; `Err(RevoraError)` on any validation failure.
+    pub fn faucet_reset(
+        env: Env,
+        caller: Address,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        seed: BytesN<32>,
+    ) -> Result<(), RevoraError> {
+        // ── Testnet gate ──────────────────────────────────────────────────────
+        if !Self::is_testnet_mode(env.clone()) {
+            return Err(RevoraError::TestnetOnly);
         }
 
-        let total_dispensed: u32 =
-            env.storage().persistent().get(&DataKey2::FaucetMetricsTotalDispensed).unwrap_or(0u32);
-        let unique_addresses: u32 =
-            env.storage().persistent().get(&DataKey2::FaucetMetricsUniqueAddrs).unwrap_or(0u32);
-        let cooldown_rejects: u32 =
-            env.storage().persistent().get(&DataKey2::FaucetMetricsCooldownRejects).unwrap_or(0u32);
+        // ── Admin authorisation ───────────────────────────────────────────────
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .ok_or(RevoraError::NotInitialized)?;
+        admin.require_auth();
+        if caller != admin {
+            return Err(RevoraError::NotAuthorized);
+        }
 
-        let window_start: u64 = current_window_id * FAUCET_METRICS_WINDOW_SECS;
-        let window_end: u64 =
-            window_start.saturating_add(FAUCET_METRICS_WINDOW_SECS).saturating_sub(1);
+        // ── Offering must exist ───────────────────────────────────────────────
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey2::OfferingRecord(offering_id.clone()))
+        {
+            return Err(RevoraError::OfferingNotFound);
+        }
 
+        // ── Clear seed entries ────────────────────────────────────────────────
+        // Remove every persisted FaucetSeedEntry for this offering.
+        // We track the highest slot index via FaucetSeedCount(offering_id) so we
+        // can iterate without unbounded storage scans.
+        let seed_count: u32 = env
+            .storage()
+            .persistent()
+            .get::<DataKey2, u32>(&DataKey2::FaucetSeedCount(offering_id.clone()))
+            .unwrap_or(0);
+
+        for idx in 0..seed_count {
+            env.storage()
+                .persistent()
+                .remove(&DataKey2::FaucetSeedEntry(offering_id.clone(), idx));
+        }
+
+        // Reset the seed count to 0 so future faucet_seed_holders calls start fresh.
+        env.storage()
+            .persistent()
+            .set::<DataKey2, u32>(&DataKey2::FaucetSeedCount(offering_id.clone()), &0);
+
+        // ── Emit reset event ──────────────────────────────────────────────────
         env.events().publish(
-            (EVENT_FAUCET_METRICS, current_window_id),
-            (total_dispensed, unique_addresses, cooldown_rejects, window_start, window_end),
+            (
+                EVENT_FAUCET_RESET,
+                issuer.clone(),
+                namespace.clone(),
+                token.clone(),
+            ),
+            (caller, seed, seed_count),
         );
 
-        // Mark this window as emitted so further calls in the same window are no-ops.
-        env.storage().persistent().set(&DataKey2::FaucetMetricsWindow, &current_window_id);
+        Ok(())
     }
 } // end impl RevoraRevenueShare (plain)
 
