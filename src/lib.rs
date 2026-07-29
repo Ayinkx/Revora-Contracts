@@ -580,6 +580,10 @@ const EVENT_META_REV_APPROVE: Symbol = symbol_short!("meta_rev");
 const EVENT_AUDIT_REPAIRED: Symbol = symbol_short!("aud_rep");
 /// Emitted when a share transfer with attestation occurs.
 const EVENT_XFER_ATT: Symbol = symbol_short!("xfer_att");
+/// Emitted when an atomic swap completes successfully.
+/// Topic: `(swap_v1, issuer, namespace, token)`
+/// Data: `(seller, buyer, amount_bps, payment_asset, payment_amount, royalty_amount)`.
+const EVENT_SWAP_V1: Symbol = symbol_short!("swap_v1");
 /// Emitted when a cross-class share transfer is blocked.
 /// Data: `(offering_id, from, to, from_class, to_class)`.
 const EVENT_CLASS_XFER_BLOCK: Symbol = symbol_short!("cls_block");
@@ -3475,7 +3479,27 @@ impl RevoraRevenueShare {
     /// Atomic swap for secondary market transfers. Transfers shares from seller to buyer
     /// and settlement asset from buyer to seller, routing a royalty fee to the issuer.
     ///
+    /// All three parties (issuer, seller, buyer) must authorize the swap via `require_auth`.
+    /// The swap executes both legs atomically:
+    /// 1. Royalty fee is routed from buyer to issuer (if configured).
+    /// 2. Remaining payment is transferred from buyer to seller.
+    /// 3. Shares (amount_bps) are transferred from seller to buyer via `transfer_with_attestation`.
+    ///
+    /// If any leg fails, all previous state changes are rolled back by the Soroban host
+    /// (transaction revert), guaranteeing atomicity.
+    ///
+    /// ### Auth
+    /// - `issuer` — offering issuer or co-issuer.
+    /// - `seller` — the address selling shares.
+    /// - `buyer` — the address purchasing shares and providing payment.
+    ///
+    /// ### Events
+    /// - `swap_v1` — emitted on successful completion.
+    /// - Inherits events from `pay_secondary_market_royalty` (roy_paid) and
+    ///   `transfer_with_attestation` (sh_set2, rg_lim_d, xfer_att).
+    ///
     /// ### Errors
+    /// - `InvalidAmount` — `payment_amount` is zero or negative.
     /// - `TransferFailed` — token transfer for settlement failed.
     /// - Inherits errors from `transfer_with_attestation` and `pay_secondary_market_royalty`.
     pub fn atomic_swap(
@@ -3491,7 +3515,12 @@ impl RevoraRevenueShare {
         payment_amount: i128,
     ) -> Result<(), RevoraError> {
         issuer.require_auth();
+        seller.require_auth();
         buyer.require_auth();
+
+        if payment_amount <= 0 {
+            return Err(RevoraError::InvalidAmount);
+        }
 
         let royalty_amount = Self::pay_secondary_market_royalty(
             env.clone(),
@@ -3521,9 +3550,33 @@ impl RevoraRevenueShare {
         let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
         let net_id = env.ledger().network_id();
         Self::transfer_with_attestation(
-            env, issuer, namespace, token, seller, buyer, amount_bps, category,
-            zero_hash, net_id, 0u64, 0u64,
+            env.clone(),
+            issuer.clone(),
+            namespace.clone(),
+            token.clone(),
+            seller.clone(),
+            buyer.clone(),
+            amount_bps,
+            category,
         )?;
+
+        // ── Emit swap_v1 event ─────────────────────────────────────────────────
+        Self::emit_v2_event(
+            &env,
+            (EVENT_SWAP_V1, issuer.clone(), namespace.clone(), token.clone()),
+            (
+                seller.clone(),
+                buyer.clone(),
+                amount_bps,
+                payment_asset.clone(),
+                payment_amount,
+                royalty_amount,
+            ),
+        );
+        env.events().publish(
+            (EVENT_SWAP_V1, issuer, namespace, token),
+            (seller, buyer, amount_bps, payment_asset, payment_amount, royalty_amount),
+        );
 
         Ok(())
     }
@@ -7045,6 +7098,240 @@ impl RevoraRevenueShare {
         if from_share < amount_bps {
             return Err(RevoraError::InvalidAmount);
         }
+
+        let to_share: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::HolderShare(offering_id.clone(), to.clone()))
+            .unwrap_or(0);
+
+        let cat_key = DataKey2::HolderCategory(offering_id.clone(), to.clone());
+        let existing_cat: Option<Symbol> = env.storage().persistent().get(&cat_key);
+        if let Some(existing) = existing_cat {
+            if existing != category {
+                if to_share > 0 {
+                    let old_count_key =
+                        DataKey2::CategoryHolderCount(offering_id.clone(), existing);
+                    let old_count: u32 =
+                        env.storage().persistent().get(&old_count_key).unwrap_or(0);
+                    env.storage().persistent().set(&old_count_key, &old_count.saturating_sub(1));
+
+                    let new_count_key =
+                        DataKey2::CategoryHolderCount(offering_id.clone(), category.clone());
+                    let new_count: u32 =
+                        env.storage().persistent().get(&new_count_key).unwrap_or(0);
+                    if let Some(restrictions) =
+                        env.storage().persistent().get::<_, TransferRestrictions>(
+                            &DataKey2::TransferRestrictions(offering_id.clone(), category.clone()),
+                        )
+                    {
+                        if new_count >= restrictions.max_holders {
+                            return Err(RevoraError::CategoryCapReached);
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Per-jurisdiction transfer cooldown check ──
+        // Look up the `from` holder's jurisdiction and check whether a cooldown
+        // is configured for that jurisdiction.  If so, verify the required time
+        // has elapsed since the holder's last transfer.
+        let jurisdiction = Self::get_holder_jurisdiction_internal(&env, &offering_id, &from);
+        if let Some(jur) = jurisdiction {
+            if jur != EVENT_JUR_UNSET {
+                let cooldown_key = DataKey2::TransferCooldownConfig(offering_id.clone(), jur.clone());
+                if let Some(cooldown_secs) =
+                    env.storage().persistent().get::<DataKey2, u64>(&cooldown_key)
+                {
+                    if cooldown_secs > 0 {
+                        let last_xfer_key =
+                            DataKey2::HolderLastTransferTime(offering_id.clone(), from.clone());
+                        let last_xfer: u64 =
+                            env.storage().persistent().get(&last_xfer_key).unwrap_or(0);
+                        let now = env.ledger().timestamp();
+                        if now < last_xfer.saturating_add(cooldown_secs) {
+                            return Err(RevoraError::TransferCooldownActive);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check all transfer eligibility gates in one place.
+    ///
+    /// Validates that a transfer between `from` and `to` within the given
+    /// offering and category is permitted.  This gate is called by
+    /// `transfer_with_attestation`.  Note that `estimate_transfer` duplicates
+    /// these checks inline (including the cooldown check) as a public query
+    /// endpoint so callers can dry-run without issuer auth.
+    ///
+    /// # Checks performed
+    /// - Contract not frozen
+    /// - Non-zero amount
+    /// - Neither party blacklisted
+    /// - `to` jurisdiction allowed
+    /// - Lockup schedule not active
+    /// - Sender has enough shares
+    /// - Category capacity not exceeded
+    /// - Per-jurisdiction transfer cooldown has elapsed
+    fn check_transfer_eligibility(
+        env: &Env,
+        issuer: &Address,
+        namespace: &Symbol,
+        token: &Address,
+        from: &Address,
+        to: &Address,
+        amount_bps: u32,
+        category: &Symbol,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(env)?;
+
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+
+        if from == to {
+            return Ok(());
+        }
+
+        // Zero-value transfer is meaningless
+        if amount_bps == 0 {
+            return Err(RevoraError::InvalidAmount);
+        }
+
+        // Blacklist check
+        if Self::is_blacklisted(env.clone(), issuer.clone(), namespace.clone(), token.clone(), from.clone()) {
+            return Err(RevoraError::HolderBlacklisted);
+        }
+        if Self::is_blacklisted(env.clone(), issuer.clone(), namespace.clone(), token.clone(), to.clone()) {
+            return Err(RevoraError::HolderBlacklisted);
+        }
+
+        // Jurisdiction block
+        Self::require_holder_jurisdiction_allowed(
+            env,
+            &offering_id,
+            to,
+            symbol_short!("xfer"),
+        )?;
+
+        // Lockup violation check: reject transfer if lockup is still active
+        if let Some(schedule) = Self::get_lockup_schedule(env.clone(), issuer.clone(), namespace.clone(), token.clone()) {
+            let now = env.ledger().timestamp();
+            let unlocked_bps = schedule.calculate_unlocked_bps(now);
+            if unlocked_bps < 10_000 {
+                env.events().publish(
+                    (EVENT_LOCKUP_VIOLATION, from.clone()),
+                    (to.clone(), amount_bps, schedule.clone()),
+                );
+                return Err(RevoraError::LockupViolation);
+            }
+        }
+
+        let from_share: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::HolderShare(offering_id.clone(), from.clone()))
+            .unwrap_or(0);
+        if from_share < amount_bps {
+            return Err(RevoraError::InvalidAmount);
+        }
+
+        let to_share: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::HolderShare(offering_id.clone(), to.clone()))
+            .unwrap_or(0);
+
+        let cat_key = DataKey2::HolderCategory(offering_id.clone(), to.clone());
+        let existing_cat: Option<Symbol> = env.storage().persistent().get(&cat_key);
+        if let Some(existing) = existing_cat {
+            if existing != category {
+                if to_share > 0 {
+                    let old_count_key =
+                        DataKey2::CategoryHolderCount(offering_id.clone(), existing);
+                    let old_count: u32 =
+                        env.storage().persistent().get(&old_count_key).unwrap_or(0);
+
+                    let new_count_key =
+                        DataKey2::CategoryHolderCount(offering_id.clone(), category.clone());
+                    let new_count: u32 =
+                        env.storage().persistent().get(&new_count_key).unwrap_or(0);
+                    if let Some(restrictions) =
+                        env.storage().persistent().get::<_, TransferRestrictions>(
+                            &DataKey2::TransferRestrictions(offering_id.clone(), category.clone()),
+                        )
+                    {
+                        if new_count >= restrictions.max_holders {
+                            return Err(RevoraError::CategoryCapReached);
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Per-jurisdiction transfer cooldown check ──
+        // Look up the `from` holder's jurisdiction and check whether a cooldown
+        // is configured for that jurisdiction.  If so, verify the required time
+        // has elapsed since the holder's last transfer.
+        let jurisdiction = Self::get_holder_jurisdiction_internal(env, &offering_id, from);
+        if let Some(jur) = jurisdiction {
+            if jur != EVENT_JUR_UNSET {
+                let cooldown_key = DataKey2::TransferCooldownConfig(offering_id.clone(), jur.clone());
+                if let Some(cooldown_secs) =
+                    env.storage().persistent().get::<DataKey2, u64>(&cooldown_key)
+                {
+                    if cooldown_secs > 0 {
+                        let last_xfer_key =
+                            DataKey2::HolderLastTransferTime(offering_id.clone(), from.clone());
+                        let last_xfer: u64 =
+                            env.storage().persistent().get(&last_xfer_key).unwrap_or(0);
+                        let now = env.ledger().timestamp();
+                        if now < last_xfer.saturating_add(cooldown_secs) {
+                            return Err(RevoraError::TransferCooldownActive);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn transfer_with_attestation(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        from: Address,
+        to: Address,
+        amount_bps: u32,
+        category: Symbol,
+    ) -> Result<(), RevoraError> {
+        Self::check_transfer_eligibility(&env, &issuer, &namespace, &token, &from, &to, amount_bps, &category)?;
+        issuer.require_auth();
+
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+
+        if from == to {
+            return Ok(());
+        }
+
+        let from_share: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::HolderShare(offering_id.clone(), from.clone()))
+            .unwrap_or(0);
 
         let to_share: u32 = env
             .storage()
