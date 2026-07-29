@@ -93,24 +93,6 @@
 
 use soroban_sdk::{contracterror, contracttype, xdr::ToXdr, Address, Bytes, BytesN, Env, Vec};
 
-// ── Depth bound ─────────────────────────────────────────────────────────────
-
-/// Maximum number of sibling hashes accepted in a single Merkle membership proof.
-///
-/// A binary Merkle tree over 2³² leaves has depth 32, so this bound is sufficient
-/// for any realistic snapshot while capping the per-call gas cost and preventing
-/// memory exhaustion from adversarially crafted proof vectors.
-///
-/// # Developer notes
-///
-/// * The check is performed **before** any SHA-256 computation, making it O(1).
-/// * Off-chain clients should never need a proof longer than `ceil(log2(N))` where
-///   `N` is the number of leaves in the snapshot.  For the current `MAX_SNAPSHOT_BATCH`
-///   of 50 leaves the maximum valid proof depth is 6 — far below this ceiling.
-/// * Increasing this value is a backwards-compatible change (old proofs remain valid).
-///   Decreasing it is a breaking change and requires a new contract version.
-pub const MAX_PROOF_DEPTH: u32 = 32;
-
 // ── Error type ─────────────────────────────────────────────────────────────
 
 /// Errors returned by the Merkle-helper functions.
