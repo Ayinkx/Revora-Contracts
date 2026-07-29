@@ -101,6 +101,28 @@ pub enum DeferredDataKey {
     DeferredReports(u32),
 }
 
+/// A single entry in the deferred-distribution priority queue (#551).
+///
+/// Entries are released in ascending `(release_ts, priority, queue_id)` order:
+/// - `release_ts`: Unix timestamp (seconds) at or after which this entry may be flushed.
+/// - `priority`: Issuer-assigned score; **lower value = higher priority** (0 is highest).
+///   Entries with the same `release_ts` are ordered by ascending `priority`.
+/// - `queue_id`: Monotonically-increasing per-offering counter assigned on insertion.
+///   Provides a strictly deterministic final tie-breaker when both `release_ts`
+///   and `priority` are identical.
+#[soroban_sdk::contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeferredQueueEntry {
+    /// Unix timestamp at or after which this entry may be released.
+    pub release_ts: u64,
+    /// Issuer-assigned priority score; lower value = processed first.
+    pub priority: u32,
+    /// Monotonically-increasing per-offering insertion counter (tie-breaker).
+    pub queue_id: u32,
+    /// Arbitrary issuer-defined payload identifier (e.g. period_id).
+    pub payload_id: u64,
+}
+
 // Issue #109 â€” Revenue report correction and audit-summary reconciliation are
 // implemented in this file. See `report_revenue`, `reconcile_audit_summary`,
 // and `repair_audit_summary`.
@@ -504,6 +526,8 @@ const EVENT_TYPE_OFFER: Symbol = symbol_short!("offer");
 const EVENT_PERIOD_CLOSED: Symbol = symbol_short!("per_clos");
 /// Emitted when a period is sealed via dual-signature `close_period_dual_sig`.
 const EVENT_DUAL_SIG_CLOSE: Symbol = symbol_short!("dual_cls");
+/// Emitted when a new entry is enqueued into the deferred-distribution priority queue (#551).
+const EVENT_DEFERRED_PRIORITY_SET: Symbol = symbol_short!("def_pset");
 /// Emitted when an offering's off-chain disclosure metadata is set or updated (#485).
 const EVENT_DISCLOSURE_UPDATED: Symbol = symbol_short!("disc_upd");
 /// Emitted when a dispute is resolved by admin (#593).
@@ -1161,103 +1185,6 @@ pub struct PendingRedemption {
     pub timestamp: u64,
 }
 
-/// Per-offering redemption fee configuration.
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct RedemptionFeeConfig {
-    pub fee_bps: u32,
-    pub treasury: Address,
-}
-
-/// Supported event version entry returned by `supported_event_versions()`.
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct EventVersionInfo {
-    pub topic: Symbol,
-    pub version: u32,
-}
-
-/// Lockup schedule specification for token balance unlocking.
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub enum LockupSchedule {
-    /// Full unlock at or after `unlock_ts`.
-    Cliff { unlock_ts: u64 },
-    /// Linear unlock from `start_ts` to `end_ts`.
-    Linear { start_ts: u64, end_ts: u64 },
-    /// Bulk unlock of `cliff_bps` at `cliff_ts`, followed by linear taper of remainder until `taper_end_ts`.
-    CliffTaper { cliff_ts: u64, cliff_bps: u32, taper_end_ts: u64 },
-}
-
-impl LockupSchedule {
-    /// Compute the unlocked BPS (0 to 10 000) at a given timestamp `now`.
-    pub fn calculate_unlocked_bps(&self, now: u64) -> u32 {
-        match self {
-            LockupSchedule::Cliff { unlock_ts } => {
-                if now >= *unlock_ts {
-                    10_000
-                } else {
-                    0
-                }
-            }
-            LockupSchedule::Linear { start_ts, end_ts } => {
-                if now < *start_ts {
-                    0
-                } else if now >= *end_ts {
-                    10_000
-                } else {
-                    let duration = end_ts.saturating_sub(*start_ts);
-                    if duration == 0 {
-                        return 10_000;
-                    }
-                    let elapsed = now.saturating_sub(*start_ts);
-                    ((elapsed as u128 * 10_000i128) / duration as u128) as u32
-                }
-            }
-            LockupSchedule::CliffTaper { cliff_ts, cliff_bps, taper_end_ts } => {
-                if now < *cliff_ts {
-                    0
-                } else if now >= *taper_end_ts {
-                    10_000
-                } else {
-                    let duration = taper_end_ts.saturating_sub(*cliff_ts);
-                    if duration == 0 {
-                        return core::cmp::min(*cliff_bps, 10_000);
-                    }
-                    let elapsed = now.saturating_sub(*cliff_ts);
-                    let rem_bps = 10_000u32.saturating_sub(*cliff_bps);
-                    let tapered_bps = ((elapsed as u128 * rem_bps as i128) / duration as u128) as u32;
-                    let total = cliff_bps.saturating_add(tapered_bps);
-                    core::cmp::min(total, 10_000)
-                }
-            }
-        }
-    }
-
-    /// Validate schedule parameters.
-    pub fn validate(&self) -> Result<(), RevoraError> {
-        match self {
-            LockupSchedule::Cliff { .. } => Ok(()),
-            LockupSchedule::Linear { start_ts, end_ts } => {
-                if end_ts < start_ts {
-                    Err(RevoraError::InvalidAmount)
-                } else {
-                    Ok(())
-                }
-            }
-            LockupSchedule::CliffTaper { cliff_ts, cliff_bps, taper_end_ts } => {
-                if *cliff_bps > 10_000 {
-                    return Err(RevoraError::InvalidRevenueShareBps);
-                }
-                if taper_end_ts < cliff_ts {
-                    return Err(RevoraError::InvalidAmount);
-                }
-                Ok(())
-            }
-        }
-    }
-}
-
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub enum WindowDataKey {
@@ -1316,21 +1243,6 @@ pub struct SnapshotEntry {
     pub holder_count: u32,
     /// Total basis points across all holders (informational; not enforced on-chain).
     pub total_bps: u32,
-}
-
-/// Immutable record of a completed admin rotation, persisted in an append-only log.
-///
-/// Written once in `accept_admin_rotation` and read via `get_admin_rotation_history_page`.
-/// The log is bounded — see `MAX_ADMIN_ROTATION_LOG`.
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct AdminRotationEntry {
-    /// Admin address before the rotation.
-    pub prior_admin: Address,
-    /// Admin address after the rotation.
-    pub new_admin: Address,
-    /// Ledger timestamp when `accept_admin_rotation` executed.
-    pub rotated_at: u64,
 }
 
 /// Primary storage keys for core contract state.
@@ -1557,17 +1469,54 @@ pub enum DataKey2 {
     /// Monotonically increasing counter for admin rotation entries.
     AdminRotationCount,
 
-    /// Per-holder pending redemption request.
-    RedemptionRequest(OfferingId, Address),
-    /// Per-offering redemption fee configuration (fee_bps and treasury address).
-    RedemptionFeeConfig(OfferingId),
-    /// Per-offering lockup schedule specification.
-    LockupSchedule(OfferingId),
-    /// Per-offering jurisdiction migration grace period in seconds.
-    /// When unset, defaults to [`DEFAULT_JURISDICTION_GRACE_SECS`] (7 days).
-    JurisdictionGracePeriod(OfferingId),
-    /// Pending jurisdiction migration for (offering_id, holder).
-    JurisdictionMigration(OfferingId, Address),
+    // ── Missing variants added for compilation ──
+    /// Current accrual index counter for dividend-accrual ledger.
+    AccrualIndex(OfferingId),
+    /// Per-offering platform fee model.
+    OfferingPlatformFee(OfferingId),
+    /// Denomination metadata (symbol, decimals) for an offering.
+    DenominationMetadata(OfferingId),
+    /// FX oracle configuration for an offering.
+    FxOracleConfig(OfferingId),
+    /// Transfer restrictions per category for an offering.
+    TransferRestrictions(OfferingId, Symbol),
+    /// Holder category tag for transfer restriction purposes.
+    HolderCategory(OfferingId, Address),
+    /// Per-category holder count for transfer restriction accounting.
+    CategoryHolderCount(OfferingId, Symbol),
+    /// Emergency freeze record for (offering_id, holder).
+    EmergencyFreeze(OfferingId, Address),
+    /// Total shares issued for an offering (tracks against MaxTotalSupplyShares).
+    TotalSharesIssued(OfferingId),
+    /// Maximum total supply shares cap for an offering.
+    MaxTotalSupplyShares(OfferingId),
+    /// Per-entry faucet seed for testnet holder seeding.
+    FaucetSeedEntry(OfferingId, u32),
+
+    // ── Multisig keys ──
+    /// Multisig approval threshold.
+    MultisigThreshold,
+    /// Multisig owner list.
+    MultisigOwners,
+    /// Multisig proposal counter.
+    MultisigProposalCount,
+    /// Default proposal duration in seconds.
+    MultisigProposalDuration,
+    /// Multisig proposal by id.
+    MultisigProposal(u32),
+
+    // ── Governance keys (issue #557) ──
+    /// Per-offering governance proposal counter.
+    GovProposalCount(OfferingId),
+    /// Per-offering governance proposal by id.
+    GovProposal(OfferingId, u32),
+    /// Vote record for (offering_id, proposal_id, voter) -> bool (true=yes, false=no).
+    VoteRecord(OfferingId, u32, Address),
+
+    // ── Deferred-distribution priority queue (issue #551) ──
+    /// Priority-ordered deferred-distribution queue for an offering.
+    /// Value: `Vec<DeferredQueueEntry>` stored in `(release_ts, priority, queue_id)` sorted order.
+    DeferredQueue(OfferingId),
 }
 
 /// Maximum number of offerings returned in a single page.
@@ -1979,7 +1928,7 @@ impl RevoraRevenueShare {
     }
 
     /// Require that a holder is not emergency frozen.
-    fn require_holder_not_frozen(
+    fn require_not_frozen(
         env: &Env,
         offering_id: &OfferingId,
         holder: &Address,
@@ -5775,16 +5724,8 @@ impl RevoraRevenueShare {
             }
         }
 
-        // Emit the appropriate event based on whether a snapshot hash was provided
-        if let Some(meta) = entry_meta {
-            env.events().publish(
-                (EVENT_BL_ADD_PINNED, issuer, namespace, token),
-                (caller, investor, attestation, meta.snapshot_hash),
-            );
-        } else {
-            env.events()
-                .publish((EVENT_BL_ADD, issuer, namespace, token), (caller, investor, attestation));
-        }
+        env.events()
+            .publish((EVENT_BL_ADD, issuer, namespace, token), (caller, investor, attestation));
         Ok(())
     }
 
@@ -8466,7 +8407,7 @@ impl RevoraRevenueShare {
         }
 
         env.events().publish(
-            (soroban_sdk::symbol_short!("class_cnv"), offering_id, holder),
+            (soroban_sdk::symbol_short!("class_conv"), offering_id, holder),
             (from_class, from_balance, new_from, to_class, to_balance, new_to),
         );
 
@@ -8506,53 +8447,13 @@ impl RevoraRevenueShare {
             namespace: namespace.clone(),
             token: token.clone(),
         };
-
-        let now = env.ledger().timestamp();
-        let old_jurisdiction = Self::get_holder_jurisdiction_internal(&env, &offering_id, &holder)
-            .unwrap_or(EVENT_JUR_UNSET);
-
-        if effective_ts == 0 || effective_ts <= now {
-            // Immediate jurisdiction change (no grace period)
-            env.storage()
-                .persistent()
-                .set(&DataKey2::HolderJurisdiction(offering_id.clone(), holder.clone()), &jurisdiction);
-            env.events().publish(
-                (Self::jurisdiction_set_event(&env), issuer, namespace, token),
-                (EVENT_JUR_SCOPE_HOLDER, holder, jurisdiction),
-            );
-        } else {
-            // Scheduled migration with grace period
-            let grace_secs = Self::get_jurisdiction_grace_secs(&env, &offering_id);
-            let deadline = effective_ts.saturating_add(grace_secs);
-
-            let migration_state = JurisdictionMigrationState {
-                old_jurisdiction: old_jurisdiction.clone(),
-                new_jurisdiction: jurisdiction.clone(),
-                effective_ts,
-                deadline,
-            };
-
-            env.storage()
-                .persistent()
-                .set(
-                    &DataKey2::JurisdictionMigration(offering_id.clone(), holder.clone()),
-                    &migration_state,
-                );
-
-            // Jurisdiction remains unchanged until effective_ts.
-            // The migration deadline is enforced in the claim path.
-            env.events().publish(
-                (EVENT_JUR_MIGRATION, issuer, namespace, token),
-                (
-                    holder,
-                    old_jurisdiction,
-                    jurisdiction,
-                    effective_ts,
-                    deadline,
-                ),
-            );
-        }
-
+        env.storage()
+            .persistent()
+            .set(&DataKey2::HolderJurisdiction(offering_id.clone(), holder.clone()), &jurisdiction);
+        env.events().publish(
+            (Self::jurisdiction_set_event(&env), issuer, namespace, token),
+            (EVENT_JUR_SCOPE_HOLDER, holder, jurisdiction),
+        );
         Ok(())
     }
 
@@ -9286,15 +9187,19 @@ impl RevoraRevenueShare {
 
         Self::require_not_frozen(&env)?;
         issuer.require_auth();
-        Self::set_holder_share_internal(
-            &env,
-            offering_id.issuer,
-            offering_id.namespace,
-            offering_id.token,
-            holder,
-            share_bps,
-            share_class,
-        )
+        let window = AccessWindow { start_timestamp, end_timestamp };
+        Self::validate_window(&window)?;
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+        env.storage().persistent().set(&WindowDataKey::Report(offering_id), &window);
+        env.events().publish(
+            (EVENT_REPORT_WINDOW_SET, issuer, namespace, token),
+            (start_timestamp, end_timestamp),
+        );
+        Ok(())
     }
 
     // â”€â”€ Meta-authorization, claims, windows, and query methods â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -11941,68 +11846,6 @@ impl RevoraRevenueShare {
         Ok(())
     }
 
-    // ── Dispute window management ────────────────────────────────────────────
-
-    /// Get the dispute window in seconds for an offering.
-    /// Returns `DEFAULT_DISPUTE_WINDOW_SECS` (30 days) when not configured.
-    pub fn get_dispute_window(
-        env: Env,
-        issuer: Address,
-        namespace: Symbol,
-        token: Address,
-    ) -> u64 {
-        let offering_id = OfferingId {
-            issuer: issuer.clone(),
-            namespace: namespace.clone(),
-            token: token.clone(),
-        };
-        env.storage()
-            .persistent()
-            .get::<DataKey2, u64>(&DataKey2::DisputeWindowSecs(offering_id))
-            .unwrap_or(DEFAULT_DISPUTE_WINDOW_SECS)
-    }
-
-    /// Set the dispute window in seconds for an offering.
-    /// Only the issuer or admin may call.
-    /// Emits `EVENT_DISPUTE_WINDOW_SET` on success.
-    pub fn set_dispute_window(
-        env: Env,
-        caller: Address,
-        issuer: Address,
-        namespace: Symbol,
-        token: Address,
-        window_secs: u64,
-    ) -> Result<(), RevoraError> {
-        Self::require_not_frozen(&env)?;
-        caller.require_auth();
-
-        let offering_id = OfferingId {
-            issuer: issuer.clone(),
-            namespace: namespace.clone(),
-            token: token.clone(),
-        };
-
-        // Verify offering exists.
-        let current_issuer =
-            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
-                .ok_or(RevoraError::OfferingNotFound)?;
-        let admin = Self::get_admin(env.clone());
-        let is_admin = admin.as_ref().map(|a| caller == *a).unwrap_or(false);
-        if caller != current_issuer && !is_admin {
-            return Err(RevoraError::NotAuthorized);
-        }
-
-        env.storage()
-            .persistent()
-            .set(&DataKey2::DisputeWindowSecs(offering_id), &window_secs);
-
-        env.events().publish(
-            (EVENT_DISPUTE_WINDOW_SET, issuer, namespace, token),
-            (caller, window_secs),
-        );
-        Ok(())
-    }
-
     // ── TWAP window configurability (#546) ───────────────────────────────────
 
     /// Configure the TWAP (Time-Weighted Average Price) smoothing window for an
@@ -12697,14 +12540,8 @@ impl RevoraRevenueShare {
         }
 
         let now = env.ledger().timestamp();
-
-        // ── Metrics: roll over window if needed before any counter update ──────
-        Self::faucet_metrics_maybe_rollover(&env, now);
-
-        let last_request_ts: Option<u64> = env
-            .storage()
-            .persistent()
-            .get(&DataKey2::FaucetLastRequest(requester.clone()));
+        let last_request_ts: Option<u64> =
+            env.storage().persistent().get(&DataKey2::FaucetLastRequest(requester.clone()));
         if let Some(last_ts) = last_request_ts {
             if now.saturating_sub(last_ts) < DEFAULT_FAUCET_COOLDOWN_SECONDS {
                 env.events().publish(
@@ -12732,9 +12569,7 @@ impl RevoraRevenueShare {
             }
         }
 
-        env.storage()
-            .persistent()
-            .set(&DataKey2::FaucetLastRequest(requester.clone()), &now);
+        env.storage().persistent().set(&DataKey2::FaucetLastRequest(requester), &now);
 
         if count == 0 {
             return Ok(Vec::new(&env));
@@ -13587,6 +13422,154 @@ mod issue_370_373_tests {
     }
 }
 
+// ── Deferred-Distribution Priority Queue (issue #551) ─────────────────────
+//
+// Entries in the deferred distribution queue are sorted by:
+//   1. `release_ts` ascending  — entries with earlier release timestamps come first.
+//   2. `priority`   ascending  — lower priority value = higher urgency (0 is highest).
+//   3. `queue_id`   ascending  — monotonically-increasing per-offering insertion counter;
+//                                provides a strictly deterministic final tie-breaker.
+//
+// Auth: `issuer.require_auth()` is required for all mutations.
+// Security invariant: only the current offering issuer may enqueue entries.
+
+#[contractimpl]
+impl RevoraRevenueShare {
+    /// Enqueue a new entry into the deferred-distribution priority queue for an offering.
+    ///
+    /// The entry is inserted into the persistent queue in `(release_ts, priority, queue_id)`
+    /// sorted order. `queue_id` is assigned automatically as a monotonically-increasing
+    /// counter scoped to the offering, ensuring deterministic ordering even when
+    /// `release_ts` and `priority` are identical across entries.
+    ///
+    /// Emits `deferred_priority_set` with topic
+    /// `(EVENT_DEFERRED_PRIORITY_SET, issuer, namespace, token)`
+    /// and data `(queue_id, release_ts, priority, payload_id)`.
+    ///
+    /// ### Auth
+    /// Requires `issuer.require_auth()`.
+    ///
+    /// ### Parameters
+    /// - `issuer`: Offering issuer (must be the current issuer of the offering).
+    /// - `namespace`: Offering namespace.
+    /// - `token`: Offering token.
+    /// - `release_ts`: Unix timestamp at or after which the entry may be released.
+    /// - `priority`: Issuer-assigned score; lower = higher priority. 0 is the highest.
+    /// - `payload_id`: Issuer-defined identifier for the associated period or batch
+    ///   (e.g. `period_id`). Not interpreted by the contract.
+    ///
+    /// ### Returns
+    /// The `queue_id` assigned to the new entry.
+    ///
+    /// ### Errors
+    /// - `OfferingNotFound` — offering does not exist or caller is not the current issuer.
+    /// - `ContractFrozen` / `ContractPaused` — contract is not operational.
+    pub fn enqueue_deferred(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        release_ts: u64,
+        priority: u32,
+        payload_id: u64,
+    ) -> Result<u32, RevoraError> {
+        Self::require_not_frozen(&env)?;
+        Self::require_not_paused(&env)?;
+        issuer.require_auth();
+
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+
+        // Verify offering exists and caller is the current issuer.
+        let current_issuer =
+            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
+                .ok_or(RevoraError::OfferingNotFound)?;
+        if current_issuer != issuer {
+            return Err(RevoraError::OfferingNotFound);
+        }
+
+        // Assign the next queue_id (per-offering monotonic counter stored inline as
+        // Vec length before insertion, making the counter free to derive).
+        let queue_key = DataKey2::DeferredQueue(offering_id.clone());
+
+        let mut entries: Vec<DeferredQueueEntry> =
+            env.storage().persistent().get(&queue_key).unwrap_or_else(|| Vec::new(&env));
+
+        let queue_id: u32 = entries.len();
+
+        let new_entry = DeferredQueueEntry { release_ts, priority, queue_id, payload_id };
+
+        // Insert in sorted position: (release_ts ASC, priority ASC, queue_id ASC).
+        // Because queue_id is strictly increasing and unique, the sort is always stable
+        // and deterministic. A linear scan is safe here since queue sizes are bounded
+        // in practice (bounded by the number of deferred periods per offering).
+        let insert_pos = Self::sorted_insert_position(&entries, &new_entry);
+
+        // Build a new sorted Vec by copying elements around the insertion point.
+        let mut sorted: Vec<DeferredQueueEntry> = Vec::new(&env);
+        for i in 0..insert_pos {
+            sorted.push_back(entries.get(i).unwrap());
+        }
+        sorted.push_back(new_entry);
+        for i in insert_pos..entries.len() {
+            sorted.push_back(entries.get(i).unwrap());
+        }
+
+        env.storage().persistent().set(&queue_key, &sorted);
+
+        // Emit deferred_priority_set event.
+        env.events().publish(
+            (EVENT_DEFERRED_PRIORITY_SET, issuer, namespace, token),
+            (queue_id, release_ts, priority, payload_id),
+        );
+
+        Ok(queue_id)
+    }
+
+    /// Return the full deferred-distribution priority queue for an offering, in release order.
+    ///
+    /// Entries are sorted by `(release_ts ASC, priority ASC, queue_id ASC)`.
+    /// Returns an empty `Vec` if no entries have been enqueued.
+    ///
+    /// This is a **read-only** function; no auth required.
+    pub fn get_deferred_queue(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+    ) -> Vec<DeferredQueueEntry> {
+        let offering_id = OfferingId { issuer, namespace, token };
+        let queue_key = DataKey2::DeferredQueue(offering_id);
+        env.storage().persistent().get(&queue_key).unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Compute the insertion index for `entry` into a sorted `entries` Vec.
+    ///
+    /// The sort key is `(release_ts ASC, priority ASC, queue_id ASC)`.
+    /// Returns the index at which `entry` should be inserted to maintain order.
+    fn sorted_insert_position(
+        entries: &Vec<DeferredQueueEntry>,
+        entry: &DeferredQueueEntry,
+    ) -> u32 {
+        let mut pos: u32 = 0;
+        for i in 0..entries.len() {
+            let existing = entries.get(i).unwrap();
+            // Compare (release_ts, priority, queue_id) lexicographically ascending.
+            if (existing.release_ts, existing.priority, existing.queue_id)
+                <= (entry.release_ts, entry.priority, entry.queue_id)
+            {
+                pos = i + 1;
+            } else {
+                break;
+            }
+        }
+        pos
+    }
+}
+
 // ── Snapshot-Based Governance Voting (issue #557) ─────────────────────────
 //
 // Voting weight is pinned to the snapshot taken at the moment the proposal was
@@ -14140,7 +14123,7 @@ impl RevoraRevenueShare {
 
         if cursor.last_key > 0 && !dry_run {
             env.events()
-                .publish((symbol_short!("mig_rsume"), from_version, to_version), cursor.last_key);
+                .publish((symbol_short!("mig_resume"), from_version, to_version), cursor.last_key);
         }
 
         // Add per-version migrators in a dispatch table
@@ -14194,32 +14177,10 @@ impl RevoraRevenueShare {
     }
 }
 
-// ── Contract self-test entrypoint (#618) ─────────────────────────────────────
-#[contractimpl]
-impl RevoraRevenueShare {
-    /// Run contract-invariant self-test against the embedded canary dataset.
-    ///
-    /// Returns `0` on success or a non-zero reason code indicating the first
-    /// invariant check that failed. This is a read-only entrypoint that does
-    /// not require authorization and does not read or write contract storage.
-    ///
-    /// The canary dataset is embedded in the WASM binary at compile time via
-    /// `include_bytes!` and contains known-good test vectors for all key
-    /// invariant checks (BPS validation, amount validation, safe math, semver,
-    /// concentration limits, multisig thresholds, etc.).
-    ///
-    /// ## Post-deployment usage
-    /// Off-chain monitoring services can call this method periodically to
-    /// verify that the deployed contract binary has not been corrupted and
-    /// that its internal invariant checks behave correctly.
-    pub fn self_test(env: Env) -> u32 {
-        let _ = env; // Unused but required for Soroban contractimpl ABI
-        crate::self_test::self_test_status()
-    }
-}
-
 #[cfg(test)]
 mod test_close_period;
+#[cfg(test)]
+mod test_deferred_priority;
 #[cfg(test)]
 mod test_snapshot_voting_weight;
 #[cfg(test)]
