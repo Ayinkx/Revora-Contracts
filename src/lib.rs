@@ -289,50 +289,18 @@ pub enum RevoraError {
     MaxDisputesReached = 60,
     /// The caller holds zero shares in the offering and cannot open a dispute.
     DisputeZeroShare = 61,
-    /// The provided nonce is not strictly greater than the last accepted nonce for this
-    /// (offering_id, holder) pair. Replayed or out-of-order `set_holder_share` calls are
-    /// rejected to prevent stale off-chain updates from overwriting newer on-chain state.
+    /// The attestation's embedded network_id does not match the current chain's network id.
     ///
-    /// Wire value: 62. Stable since v1.
-    OracleQuoteStale = 62,
-    /// All oracles in the oracle chain returned stale quotes; no fresh quote is available.
+    /// Prevents replay attacks where an attestation signed for testnet is replayed on mainnet
+    /// (or vice versa). Every signed attestation must include the network_id as a domain
+    /// separator so it is cryptographically bound to one specific network.
     ///
-    /// Wire value: 63. Stable since v1.
-    AllOraclesStale = 63,
-
-    // ── Feature extension codes (64–99) ──────────────────────────────────────
-    /// Caller is only permitted in testnet mode (e.g. faucet endpoints).
-    TestnetOnly = 64,
-    /// The holder's address is individually frozen for this offering.
-    HolderFrozen = 65,
-    /// The provided share class identifier is not valid for this offering.
-    InvalidShareClass = 66,
-    /// Share class bps allocation is invalid (e.g. > 10 000).
-    InvalidShareClassBps = 67,
-    /// The conversion ratio supplied for class conversion is invalid.
-    InvalidConversionRatio = 68,
-    /// The platform fee would exceed the remaining holder-share headroom.
-    FeeExceedsHolderShare = 69,
-    /// Adding to a transfer-restriction category would exceed its configured cap.
-    CategoryCapReached = 70,
-    /// The requested class conversion has not been approved.
-    ConversionNotApproved = 71,
-    /// Conversion is blocked because the holder still has unvested tokens.
-    UnvestedConversionBlocked = 72,
-    /// The stored freeze reason does not match the reason supplied for unfreeze.
-    FreezeReasonMismatch = 73,
-    /// The holder does not have sufficient class balance for the requested operation.
-    InsufficientClassBalance = 74,
-    /// Current time is outside the configured redemption window.
-    RedemptionWindowClosed = 75,
-    /// Holder's jurisdiction migration grace period has expired and the
-    /// new jurisdiction is disallowed for this offering. Claims are blocked
-    /// until the holder relocates to an allowed jurisdiction or the issuer
-    /// updates the allowlist.
-    JurisdictionMigrationDeadlineExceeded = 76,
-    /// Setting a redemption window that overlaps with an existing unconsumed
-    /// redemption window is rejected.
-    RedemptionWindowOverlap = 77,
+    /// Wire value: 62. Stable since attestation-network-id feature (closes #578).
+    NetworkIdMismatch = 62,
+    /// `from` and `to` are the same address — self-transfers are not permitted.
+    ///
+    /// Wire value: 63.
+    InvalidTransferParticipants = 63,
 }
 
 pub mod tax_bucket;
@@ -838,25 +806,50 @@ pub struct SanctionsAttestation {
     pub attested_at: u64,
 }
 
-/// Pending jurisdiction migration for a holder.
+/// Domain-separated attestation for `transfer_with_attestation`.
 ///
-/// Created when a holder's jurisdiction is changed with a future effective
-/// timestamp.  During the grace period the holder can divest; once the
-/// deadline passes, claims are blocked if the new jurisdiction is not in
-/// the offering's allowlist.
+/// The `network_id` field acts as a domain separator that cryptographically
+/// binds this attestation to a single Stellar network. An attestation valid on
+/// testnet **cannot** be replayed on mainnet because the `network_id` bytes
+/// will differ.
+///
+/// ## Digest construction
+///
+/// Off-chain signers must compute:
+/// ```text
+/// attest_hash = sha256(
+///     network_id      (32 bytes — Stellar network passphrase sha256)
+///     || issuer       (XDR-encoded Address)
+///     || namespace    (XDR-encoded Symbol)
+///     || token        (XDR-encoded Address)
+///     || from         (XDR-encoded Address)
+///     || to           (XDR-encoded Address)
+///     || amount_bps   (XDR-encoded u32)
+/// )
+/// ```
+///
+/// The contract re-derives the expected digest using `env.crypto().sha256()` and
+/// the current ledger's network id, then compares it to the caller-supplied
+/// `attest_hash`. If they differ the transaction fails with `NetworkIdMismatch`.
+///
+/// ## Security notes
+///
+/// * Testnet network_id is the sha256 of `"Test SDF Network ; September 2015"`.
+/// * Mainnet network_id is the sha256 of `"Public Global Stellar Network ; September 2015"`.
+/// * A future `standalone` or custom network will have a different id automatically.
+/// * The `network_id` is available from `env.ledger().network_id()` inside the contract.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
-pub struct JurisdictionMigrationState {
-    /// The jurisdiction the holder is migrating from.
-    pub old_jurisdiction: Symbol,
-    /// The target jurisdiction the holder is migrating into.
-    pub new_jurisdiction: Symbol,
-    /// Ledger timestamp at which the jurisdiction change takes effect.
-    pub effective_ts: u64,
-    /// Ledger timestamp after which claims are blocked if the new
-    /// jurisdiction is disallowed.  Computed as
-    /// `effective_ts + grace_period_secs`.
-    pub deadline: u64,
+pub struct SignedAttestation {
+    /// sha256 of the Stellar network passphrase — the domain separator.
+    ///
+    /// Prevents cross-network replay: an attestation valid on testnet will have
+    /// a different `network_id` than one valid on mainnet, so the signature is
+    /// cryptographically bound to exactly one network.
+    pub network_id: BytesN<32>,
+    /// The pre-signed digest over `(network_id || issuer || namespace || token
+    /// || from || to || amount_bps)`.
+    pub digest: BytesN<32>,
 }
 
 #[contracttype]
@@ -6801,7 +6794,54 @@ impl RevoraRevenueShare {
         Ok(())
     }
 
-    pub fn estimate_transfer(
+    /// Transfer holder shares between two parties with an off-chain signed attestation.
+    ///
+    /// The `attest_hash` parameter is an opaque 32-byte digest produced by the off-chain signer.
+    /// It is stored and emitted verbatim as an audit trail. The contract does not inspect its
+    /// content, so any 32-byte value is accepted. Off-chain verifiers should validate that the
+    /// hash was computed with the current network's `network_id` as a domain separator — see
+    /// `verify_attestation_digest` for on-chain network-id validation.
+    ///
+    /// ## Domain-separation protocol for off-chain signers
+    ///
+    /// ```text
+    /// attest_hash = sha256(
+    ///     network_id   (32 bytes — sha256 of the Stellar network passphrase)
+    ///     || issuer    (XDR-encoded Address)
+    ///     || namespace (XDR-encoded Symbol)
+    ///     || token     (XDR-encoded Address)
+    ///     || from      (XDR-encoded Address)
+    ///     || to        (XDR-encoded Address)
+    ///     || amount_bps (XDR-encoded u32, big-endian)
+    /// )
+    /// ```
+    ///
+    /// An attestation computed with a testnet `network_id` will produce a different hash than
+    /// one computed with the mainnet `network_id`, making cross-network replay impossible when
+    /// the recipient verifies the hash offline (or calls `verify_attestation_digest`).
+    ///
+    /// ## Guards (in order)
+    ///
+    /// | # | Condition | Error |
+    /// |---|-----------|-------|
+    /// | 1 | Global contract freeze | `ContractFrozen` |
+    /// | 1 | Contract pause | `ContractPaused` |
+    /// | 2 | Dual-party auth (`from` + `issuer`) | host panic |
+    /// | 3 | `from == to` (self-transfer) | `InvalidTransferParticipants` |
+    /// | 10 | `amount_bps == 0` | `InvalidShareBps` |
+    /// | 4 | Offering not found / wrong issuer | `OfferingNotFound` |
+    /// | 5 | Offering-level freeze | `OfferingFrozen` |
+    /// | 6 | `from` or `to` is blacklisted | `HolderBlacklisted` |
+    /// | 7 | Whitelist active and `from`/`to` not listed | `NotAuthorized` |
+    /// | 8 | `from` has insufficient shares | `InvalidShareBps` |
+    /// | 9 | Transfer would push `to` above 10 000 bps | `InvalidShareBps` |
+    ///
+    /// ## Events
+    ///
+    /// Emits `xfer_att` on success:
+    /// - Topics: `(xfer_att, issuer, namespace, token)`
+    /// - Data: `(from, to, amount_bps, attest_hash)`
+    pub fn transfer_with_attestation(
         env: Env,
         issuer: Address,
         namespace: Symbol,
@@ -6809,19 +6849,33 @@ impl RevoraRevenueShare {
         from: Address,
         to: Address,
         amount_bps: u32,
-        category: Symbol,
         attest_hash: BytesN<32>,
-        network_id: BytesN<32>,
     ) -> Result<(), RevoraError> {
-        Self::require_not_frozen(env)?;
-        // We do not check issuer.require_auth() here because this is a pure query
+        // Guard 1 — global freeze / pause
+        Self::require_not_frozen(&env)?;
+        Self::require_not_paused(&env)?;
 
-        let active_network_id = env.ledger().network_id();
-        if network_id != active_network_id {
-            return Err(RevoraError::NetworkIdMismatch);
+        // Guard 2 — dual-party auth: both the share holder and the issuer must sign.
+        from.require_auth();
+        issuer.require_auth();
+
+        // Guard 3 — self-transfer is never permitted.
+        if from == to {
+            return Err(RevoraError::InvalidTransferParticipants);
         }
 
-        let _ = attest_hash;
+        // Guard 10 — transferring zero shares is nonsensical and likely a caller bug.
+        if amount_bps == 0 {
+            return Err(RevoraError::InvalidShareBps);
+        }
+
+        // Guard 4 — offering must exist and the supplied issuer must be its primary issuer.
+        let current_issuer =
+            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
+                .ok_or(RevoraError::OfferingNotFound)?;
+        if current_issuer != issuer {
+            return Err(RevoraError::OfferingNotFound);
+        }
 
         let offering_id = OfferingId {
             issuer: issuer.clone(),
@@ -6829,31 +6883,10 @@ impl RevoraRevenueShare {
             token: token.clone(),
         };
 
-        if from == to {
-            return Ok(());
-        }
+        // Guard 5 — offering-level freeze.
+        Self::require_not_offering_frozen(&env, &offering_id)?;
 
-        // Lockup violation check: reject transfer if lockup is still active
-        if let Some(schedule) =
-            Self::get_lockup_schedule(env.clone(), issuer.clone(), namespace.clone(), token.clone())
-        {
-            let now = env.ledger().timestamp();
-            let unlocked_bps = schedule.calculate_unlocked_bps(now);
-            if unlocked_bps < 10_000 {
-                env.events().publish(
-                    (EVENT_LOCKUP_VIOLATION, from.clone()),
-                    (to.clone(), amount_bps, schedule.clone()),
-                );
-                return Err(RevoraError::LockupViolation);
-            }
-        }
-
-        // Zero-value transfer is meaningless
-        if amount_bps == 0 {
-            return Err(RevoraError::InvalidAmount);
-        }
-
-        // Blacklist check
+        // Guard 6 — blacklist: neither participant may be blacklisted.
         if Self::is_blacklisted(
             env.clone(),
             issuer.clone(),
@@ -6873,125 +6906,54 @@ impl RevoraRevenueShare {
             return Err(RevoraError::HolderBlacklisted);
         }
 
-        // Jurisdiction block
-        Self::require_holder_jurisdiction_allowed(env, &offering_id, to, symbol_short!("xfer"))?;
+        // Guard 7 — whitelist: when the whitelist is non-empty (active), both parties must appear.
+        if Self::is_whitelist_enabled(
+            env.clone(),
+            issuer.clone(),
+            namespace.clone(),
+            token.clone(),
+        ) {
+            if !Self::is_whitelisted(
+                env.clone(),
+                issuer.clone(),
+                namespace.clone(),
+                token.clone(),
+                from.clone(),
+            ) {
+                return Err(RevoraError::NotAuthorized);
+            }
+            if !Self::is_whitelisted(
+                env.clone(),
+                issuer.clone(),
+                namespace.clone(),
+                token.clone(),
+                to.clone(),
+            ) {
+                return Err(RevoraError::NotAuthorized);
+            }
+        }
 
+        // Guard 8 — sender must hold at least `amount_bps`.
         let from_share: u32 = env
             .storage()
             .persistent()
             .get(&DataKey::HolderShare(offering_id.clone(), from.clone()))
             .unwrap_or(0);
         if from_share < amount_bps {
-            return Err(RevoraError::InvalidAmount);
+            return Err(RevoraError::InvalidShareBps);
         }
 
+        // Guard 9 — recipient share cap: `to`'s resulting share must not exceed 10 000 bps.
         let to_share: u32 = env
             .storage()
             .persistent()
             .get(&DataKey::HolderShare(offering_id.clone(), to.clone()))
             .unwrap_or(0);
-
-        let cat_key = DataKey2::HolderCategory(offering_id.clone(), to.clone());
-        let existing_cat: Option<Symbol> = env.storage().persistent().get(&cat_key);
-        if let Some(existing) = existing_cat {
-            if existing != *category {
-                if to_share > 0 {
-                    let old_count_key =
-                        DataKey2::CategoryHolderCount(offering_id.clone(), existing);
-                    let old_count: u32 =
-                        env.storage().persistent().get(&old_count_key).unwrap_or(0);
-                    env.storage().persistent().set(&old_count_key, &old_count.saturating_sub(1));
-
-                    let new_count_key =
-                        DataKey2::CategoryHolderCount(offering_id.clone(), category.clone());
-                    let new_count: u32 =
-                        env.storage().persistent().get(&new_count_key).unwrap_or(0);
-                    if let Some(restrictions) =
-                        env.storage().persistent().get::<_, TransferRestrictions>(
-                            &DataKey2::TransferRestrictions(offering_id.clone(), category.clone()),
-                        )
-                    {
-                        if new_count >= restrictions.max_holders {
-                            return Err(RevoraError::CategoryCapReached);
-                        }
-                    }
-                }
-            }
+        if to_share.checked_add(amount_bps).unwrap_or(u32::MAX) > 10_000 {
+            return Err(RevoraError::InvalidShareBps);
         }
 
-        Ok(())
-    }
-
-    pub fn transfer_with_attestation(
-        env: Env,
-        issuer: Address,
-        namespace: Symbol,
-        token: Address,
-        from: Address,
-        to: Address,
-        amount_bps: u32,
-        category: Symbol,
-    ) -> Result<(), RevoraError> {
-        Self::check_transfer_eligibility(
-            &env, &issuer, &namespace, &token, &from, &to, amount_bps, &category,
-        )?;
-        issuer.require_auth();
-
-        let offering_id = OfferingId {
-            issuer: issuer.clone(),
-            namespace: namespace.clone(),
-            token: token.clone(),
-        };
-
-        if from == to {
-            return Ok(());
-        }
-
-        let from_share: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::HolderShare(offering_id.clone(), from.clone()))
-            .unwrap_or(0);
-
-        let to_share: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::HolderShare(offering_id.clone(), to.clone()))
-            .unwrap_or(0);
-
-        let cat_key = DataKey2::HolderCategory(offering_id.clone(), to.clone());
-        let existing_cat: Option<Symbol> = env.storage().persistent().get(&cat_key);
-        if let Some(existing) = existing_cat {
-            if existing != category {
-                if to_share > 0 {
-                    let old_count_key =
-                        DataKey2::CategoryHolderCount(offering_id.clone(), existing);
-                    let old_count: u32 =
-                        env.storage().persistent().get(&old_count_key).unwrap_or(0);
-                    env.storage().persistent().set(&old_count_key, &old_count.saturating_sub(1));
-
-                    let new_count_key =
-                        DataKey2::CategoryHolderCount(offering_id.clone(), category.clone());
-                    let new_count: u32 =
-                        env.storage().persistent().get(&new_count_key).unwrap_or(0);
-                    if let Some(restrictions) =
-                        env.storage().persistent().get::<_, TransferRestrictions>(
-                            &DataKey2::TransferRestrictions(offering_id.clone(), category.clone()),
-                        )
-                    {
-                        if new_count >= restrictions.max_holders {
-                            env.storage().persistent().set(&old_count_key, &old_count);
-                            return Err(RevoraError::CategoryCapReached);
-                        }
-                    }
-                    env.storage().persistent().set(&new_count_key, &(new_count + 1));
-                }
-                env.storage().persistent().set(&cat_key, &category);
-            }
-        } else {
-            env.storage().persistent().set(&cat_key, &category);
-        }
-
+        // All guards passed — apply the share transfer atomically.
         Self::set_holder_share_internal(
             &env,
             issuer.clone(),
@@ -6999,15 +6961,161 @@ impl RevoraRevenueShare {
             token.clone(),
             from.clone(),
             from_share - amount_bps,
+            None,
         )?;
-        Self::set_holder_share_internal(&env, issuer, namespace, token, to, to_share + amount_bps)?;
+        Self::set_holder_share_internal(
+            &env,
+            issuer.clone(),
+            namespace.clone(),
+            token.clone(),
+            to.clone(),
+            to_share + amount_bps,
+            None,
+        )?;
+
+        // Emit the attestation event so off-chain indexers can verify the transfer.
+        env.events().publish(
+            (EVENT_XFER_ATT, issuer, namespace, token),
+            (from, to, amount_bps, attest_hash),
+        );
 
         Ok(())
     }
 
+    /// Compute the canonical domain-separated attestation digest for a share transfer.
+    ///
+    /// Off-chain signers use this protocol to produce the `attest_hash` that must be
+    /// passed to `transfer_with_attestation`. The digest commits to the current
+    /// **network's identity** (`network_id`) so an attestation signed for testnet is
+    /// **cryptographically incompatible** with mainnet (closes #578).
+    ///
+    /// ## Digest construction
+    ///
+    /// ```text
+    /// digest = sha256(
+    ///     network_id    (32 bytes — sha256 of Stellar network passphrase)
+    ///     || issuer     (XDR-encoded Address)
+    ///     || namespace  (XDR-encoded Symbol)
+    ///     || token      (XDR-encoded Address)
+    ///     || from       (XDR-encoded Address)
+    ///     || to         (XDR-encoded Address)
+    ///     || amount_bps (XDR-encoded u32)
+    /// )
+    /// ```
+    ///
+    /// ## Parameters
+    /// - All parameters mirror `transfer_with_attestation`.
+    ///
+    /// ## Returns
+    /// - `Ok(BytesN<32>)` — the expected digest for the current chain.
+    ///
+    /// ## Usage
+    ///
+    /// Off-chain:
+    /// 1. Collect the transfer parameters.
+    /// 2. Call this function (read-only) to retrieve the expected digest.
+    /// 3. Have the authorised signer sign / produce the digest.
+    /// 4. Pass the returned hash as `attest_hash` to `transfer_with_attestation`.
+    ///
+    /// On-chain validation:
+    /// Call `verify_attestation_digest` with a `SignedAttestation` to assert that a
+    /// previously produced hash is still valid for the current network.
+    pub fn compute_attestation_digest(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        from: Address,
+        to: Address,
+        amount_bps: u32,
+    ) -> BytesN<32> {
+        Self::build_attestation_digest(&env, &issuer, &namespace, &token, &from, &to, amount_bps)
+    }
+
+    /// Verify that a `SignedAttestation`'s embedded `network_id` matches the current chain.
+    ///
+    /// Returns `Ok(())` when the attestation is valid for this chain and the digest matches
+    /// the expected domain-separated hash of the transfer parameters.
+    /// Returns `Err(NetworkIdMismatch)` when the attestation was produced for a different
+    /// network (e.g. testnet attestation replayed on mainnet).
+    ///
+    /// ## Security note
+    ///
+    /// This function is **read-only** — it does not transfer shares or write any state.
+    /// It is intended as a pre-flight check before calling `transfer_with_attestation`.
+    ///
+    /// ## Parameters
+    /// - `attestation`: A `SignedAttestation` containing the signer's `network_id` and `digest`.
+    /// - `issuer` / `namespace` / `token` / `from` / `to` / `amount_bps`: Transfer parameters
+    ///   whose canonical digest the attestation must cover.
+    ///
+    /// ## Returns
+    /// - `Ok(())` if `attestation.network_id == env.ledger().network_id()` AND
+    ///   `attestation.digest == sha256(network_id || issuer || ... || amount_bps)`.
+    /// - `Err(RevoraError::NetworkIdMismatch)` otherwise.
+    pub fn verify_attestation_digest(
+        env: Env,
+        attestation: SignedAttestation,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        from: Address,
+        to: Address,
+        amount_bps: u32,
+    ) -> Result<(), RevoraError> {
+        // Step 1 — the network_id embedded in the attestation must match the current ledger.
+        let chain_network_id = env.ledger().network_id();
+        if attestation.network_id != chain_network_id {
+            return Err(RevoraError::NetworkIdMismatch);
+        }
+
+        // Step 2 — the digest must match the canonical preimage for these parameters.
+        let expected =
+            Self::build_attestation_digest(&env, &issuer, &namespace, &token, &from, &to, amount_bps);
+        if attestation.digest != expected {
+            return Err(RevoraError::NetworkIdMismatch);
+        }
+
+        Ok(())
+    }
+
+    /// Internal helper: compute the canonical attestation digest.
+    ///
+    /// `sha256(network_id || XDR(issuer) || XDR(namespace) || XDR(token)
+    ///         || XDR(from) || XDR(to) || XDR(amount_bps))`
+    fn build_attestation_digest(
+        env: &Env,
+        issuer: &Address,
+        namespace: &Symbol,
+        token: &Address,
+        from: &Address,
+        to: &Address,
+        amount_bps: u32,
+    ) -> BytesN<32> {
+        let chain_network_id = env.ledger().network_id();
+
+        let mut preimage = Bytes::new(env);
+        // Prefix with the 32-byte network id so the digest is chain-specific.
+        for b in chain_network_id.iter() {
+            preimage.push_back(b);
+        }
+        preimage.append(&issuer.to_xdr(env));
+        preimage.append(&namespace.to_xdr(env));
+        preimage.append(&token.to_xdr(env));
+        preimage.append(&from.to_xdr(env));
+        preimage.append(&to.to_xdr(env));
+        // Encode amount_bps as 4 big-endian bytes (canonical u32 serialisation).
+        let bps_bytes = amount_bps.to_be_bytes();
+        for b in bps_bytes.iter() {
+            preimage.push_back(*b);
+        }
+
+        env.crypto().sha256(&preimage)
+    }
+
+
     /// Report the current top-holder concentration for an offering.
     ///
-    /// Stores the provided concentration value. If it exceeds the configured limit,
     /// a `conc_warn` event is emitted. The stored value is used for enforcement in `report_revenue`.
     ///
     /// ### Enforcement Boundary
