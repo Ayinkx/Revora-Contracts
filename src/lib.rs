@@ -636,6 +636,11 @@ const EVENT_AUTO_FRZ: Symbol = symbol_short!("auto_frz");
 /// Data: `(jurisdiction: Symbol, cooldown_secs: u64)`
 const EVENT_TRANSFER_COOLDOWN_SET: Symbol = symbol_short!("tr_cool");
 
+/// Debug tracing event emitted by `get_holder_accrued_unclaimed`.
+/// Topic: `(acc_snap, issuer, namespace, token)`
+/// Data: `(holder, last_settled_idx, matured_end, accrued_owed, total)`
+const EVENT_ACC_SNAP: Symbol = symbol_short!("acc_snap");
+
 /// ── Regulatory-limit delta event (reg_limit_delta event stream) ──
 ///
 /// Emitted on every holding change (issuance or transfer) that affects a
@@ -12200,6 +12205,114 @@ impl RevoraRevenueShare {
         }
 
         Self::compute_claimable_preview(&env, &offering_id, &holder, start_idx, Some(count))
+    }
+
+    /// Per-holder accrual snapshot: returns the total unclaimed dividend balance
+    /// across all periods by walking the accrual ledger since the holder's last
+    /// claim checkpoint.
+    ///
+    /// This is a pure read-only query and does not mutate contract state.
+    /// The computation is bounded per-holder; it walks only the holder's share
+    /// schedule entries and accrual-index snapshots between `last_settled_idx`
+    /// and the current matured end, without iterating every period individually
+    /// through a per-period loop.
+    ///
+    /// # Arguments
+    ///
+    /// * `issuer`    — The offering issuer address.
+    /// * `namespace` — The offering namespace identifier.
+    /// * `token`     — The offering token address.
+    /// * `holder`    — The holder address to compute accrued unclaimed for.
+    ///
+    /// # Returns
+    ///
+    /// Returns `i128` — the total amount currently accrued but unclaimed for this
+    /// holder. Returns `0` for blacklisted holders or holders with no unclaimed
+    /// periods.
+    ///
+    /// # Gas
+    ///
+    /// Gas scales with the number of share-schedule entries (share changes) and
+    /// the number of periods since the last settlement. Both are naturally bounded
+    /// by checkpoint compression (default threshold: 1 000 schedule entries) and
+    /// the offering's total period count.
+    pub fn get_holder_accrued_unclaimed(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        holder: Address,
+    ) -> i128 {
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+
+        // Fast-path: blacklisted holders always return 0.
+        if Self::is_blacklisted(env.clone(), issuer, namespace, token, holder.clone()) {
+            return 0;
+        }
+
+        // Get the holder's current accrual state.  This includes the frozen
+        // `accrued_owed` from previous share-change settlements and correctly
+        // advances `last_settled_idx` past any `last_claimed_idx` advances.
+        let state = Self::get_holder_accrual_state(&env, &offering_id, &holder);
+
+        // Find how many periods have matured beyond their claim delay (if any).
+        let matured_end =
+            Self::find_matured_claim_end_idx(&env, &offering_id, state.last_settled_idx);
+
+        // Start total from already-frozen accrued_owed.
+        let mut total = state.accrued_owed;
+
+        // Compute additional accrual for periods since the last settlement.
+        if matured_end > state.last_settled_idx {
+            total = total.saturating_add(Self::compute_holder_payout_for_range(
+                &env,
+                &offering_id,
+                &holder,
+                state.last_settled_idx,
+                matured_end,
+            ));
+        }
+
+        // Handle accrual anchor: compressed share-schedule entries that were
+        // folded into a pre-computed sum during checkpoint compression.  The
+        // anchor must be included if it covers periods after the last claim,
+        // even though those entries have been pruned from the live schedule.
+        let anchor_key = DataKey2::AccrualAnchor(offering_id.clone(), holder.clone());
+        if let Some(anchor) = env.storage().persistent().get::<_, AccrualAnchor>(&anchor_key) {
+            let last_claimed_idx: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::LastClaimedIdx(offering_id.clone(), holder.clone()))
+                .unwrap_or(0);
+            if last_claimed_idx <= anchor.end_idx {
+                total = total.saturating_add(anchor.claimable_sum);
+            }
+        }
+
+        // Emit debug tracing event.  Even though this is a read-only query,
+        // the event is visible in simulation responses, giving integrators
+        // full visibility into the computation breakdown.
+        env.events().publish(
+            (
+                EVENT_ACC_SNAP,
+                offering_id.issuer,
+                offering_id.namespace,
+                offering_id.token,
+            ),
+            (
+                holder.clone(),
+                state.last_settled_idx,
+                matured_end,
+                state.accrued_owed,
+                total,
+            ),
+        );
+
+        total
     }
 
     // â”€â”€ Time-delayed claim configuration (#27) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
