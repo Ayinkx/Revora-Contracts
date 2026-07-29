@@ -1155,6 +1155,22 @@ pub struct PendingRedemption {
     pub timestamp: u64,
 }
 
+/// Per-offering redemption fee configuration.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RedemptionFeeConfig {
+    pub fee_bps: u32,
+    pub treasury: Address,
+}
+
+/// Supported event version entry returned by `supported_event_versions()`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct EventVersionInfo {
+    pub topic: Symbol,
+    pub version: u32,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub enum WindowDataKey {
@@ -1454,6 +1470,10 @@ pub enum DataKey2 {
     /// Monotonically increasing counter for admin rotation entries.
     AdminRotationCount,
 
+    /// Per-holder pending redemption request.
+    RedemptionRequest(OfferingId, Address),
+    /// Per-offering redemption fee configuration (fee_bps and treasury address).
+    RedemptionFeeConfig(OfferingId),
     /// Per-offering jurisdiction migration grace period in seconds.
     /// When unset, defaults to [`DEFAULT_JURISDICTION_GRACE_SECS`] (7 days).
     JurisdictionGracePeriod(OfferingId),
@@ -4143,6 +4163,30 @@ impl RevoraRevenueShare {
         env.storage().persistent().set(&DataKey2::EmitV2Compat, &enabled);
         env.events().publish((EVENT_V2_COMPAT_SET, caller), enabled);
         Ok(())
+    }
+
+    /// Return the list of currently supported event index topics and their schema versions.
+    ///
+    /// Non-authorized, read-only query intended for indexers to negotiate topic
+    /// versions before subscribing.
+    ///
+    /// V3 topic (`ev_idx3`, version 3) is always present.
+    /// V2 topic (`ev_idx2`, version 2) is included when `EmitV2Compat` is enabled.
+    pub fn supported_event_versions(env: Env) -> Vec<EventVersionInfo> {
+        let mut list = Vec::new(&env);
+        // V3 topic is canonical and always active
+        list.push_back(EventVersionInfo {
+            topic: symbol_short!("ev_idx3"),
+            version: 3,
+        });
+        // V2 topic is active if v2 compat shim is enabled
+        if Self::is_emit_v2_compat(&env) {
+            list.push_back(EventVersionInfo {
+                topic: symbol_short!("ev_idx2"),
+                version: 2,
+            });
+        }
+        list
     }
 
     /// Query the paused state of the contract.
