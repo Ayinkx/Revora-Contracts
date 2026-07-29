@@ -622,6 +622,9 @@ const EVENT_LOCKUP_SET: Symbol = symbol_short!("lock_set");
 /// Emitted when a transfer is attempted while the offering has active lockup restrictions.
 /// Includes the caller, unlock timestamp, and attempted amount for indexer alerting.
 const EVENT_LOCKUP_VIOLATION: Symbol = symbol_short!("lock_viol");
+/// Emitted when a lockup schedule's taper_end_ts is extended with holder consent.
+/// Data: `(offering_id, new_taper_end_ts, attestation_digest)`.
+const EVENT_LOCKUP_EXTEND: Symbol = symbol_short!("lock_ext");
 const EVENT_PLATFORM_FEE_SET: Symbol = symbol_short!("fee_set");
 const EVENT_FRZ_SET: Symbol = symbol_short!("frz_set");
 const EVENT_FRZ_CLR: Symbol = symbol_short!("frz_clr");
@@ -11509,6 +11512,90 @@ impl RevoraRevenueShare {
         let schedule = Self::get_lockup_schedule(env.clone(), issuer, namespace, token);
         let now = env.ledger().timestamp();
         schedule.map(|s| s.calculate_unlocked_bps(now)).unwrap_or(10_000)
+    }
+
+    /// Extend the taper end timestamp of a lockup schedule with holder consent.
+    ///
+    /// Insider lockups sometimes need to be extended for regulatory or contractual
+    /// reasons.  This entrypoint pushes `taper_end_ts` forward; it may **never**
+    /// shorten an existing lockup.  The holder must sign an off-chain attestation
+    /// consenting to the extension.
+    ///
+    /// # Parameters
+    ///
+    /// * `issuer` — the offering issuer (must authorise).
+    /// * `namespace` / `token` — identify the offering.
+    /// * `holder` — the locked holder who consents to the extension.
+    /// * `new_taper_end_ts` — new taper end timestamp (must be > current `taper_end_ts`).
+    /// * `attestation` — a [`SignedAttestation`] committing to the extension parameters.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` — the extension was applied and persisted.
+    /// * `Err(RevoraError::InvalidAmount)` — `new_taper_end_ts <= current taper_end_ts`
+    ///   or no lockup schedule exists for this offering.
+    /// * `Err(RevoraError::NetworkIdMismatch)` — the attestation was produced for a
+    ///   different network.
+    ///
+    /// # Events
+    ///
+    /// Emits [`EVENT_LOCKUP_EXTEND`] with `(offering_id, new_taper_end_ts, attestation.digest)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn extend_lockup(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        holder: Address,
+        new_taper_end_ts: u64,
+        attestation: SignedAttestation,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+        Self::require_not_paused(&env)?;
+        issuer.require_auth();
+
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+
+        // ── Verify attestation ───────────────────────────────────────────────
+        Self::verify_attestation_digest(
+            env.clone(),
+            attestation.clone(),
+            issuer.clone(),
+            namespace.clone(),
+            token.clone(),
+            holder.clone(),
+            holder.clone(),
+            0,
+        )?;
+
+        // ── Fetch and validate existing schedule ─────────────────────────────
+        let key = DataKey2::LockupSchedule(offering_id.clone());
+        let existing: LockupSchedule =
+            env.storage().persistent().get(&key).ok_or(RevoraError::InvalidAmount)?;
+
+        // ── Monotonic extension check ───────────────────────────────────────
+        // Match on the existing variant and apply the extension.
+        let updated = match existing {
+            LockupSchedule::CliffTaper { cliff_ts, cliff_bps, taper_end_ts } => {
+                if new_taper_end_ts <= taper_end_ts {
+                    return Err(RevoraError::InvalidAmount);
+                }
+                LockupSchedule::CliffTaper { cliff_ts, cliff_bps, taper_end_ts: new_taper_end_ts }
+            }
+        };
+
+        env.storage().persistent().set(&key, &updated);
+
+        env.events().publish(
+            (EVENT_LOCKUP_EXTEND, issuer, namespace, token),
+            (holder, new_taper_end_ts, attestation.digest),
+        );
+
+        Ok(())
     }
 
     /// Preview the total claimable amount for a holder without mutating state.
