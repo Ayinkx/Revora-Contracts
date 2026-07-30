@@ -1681,6 +1681,11 @@ pub(crate) enum DataKey2 {
     /// Ledger timestamp of the last transfer for (offering_id, holder).
     /// Used by the cooldown check to reject premature transfers.
     HolderLastTransferTime(OfferingId, Address),
+
+    // ── Tax bucket (issue #535) ──
+    /// Remaining cost basis for a holder in an offering.
+    /// Used to cap return-of-capital distributions.
+    RemainingBasis(OfferingId, Address),
 }
 
 /// Maximum number of offerings returned in a single page.

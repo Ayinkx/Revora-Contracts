@@ -17,6 +17,13 @@ pub const EVENT_TAX_ROLLOVER: Symbol = symbol_short!("tax_roll");
 /// 5. `timestamp`        — Ledger timestamp at the time of the event.
 pub const EVENT_TAX_LOT_V1: Symbol = symbol_short!("tax_lt1");
 
+/// Emitted when return-of-capital is capped by remaining cost basis.
+/// The excess amount is reclassified as capital gains.
+///
+/// Topic:  `(tax_recls, issuer, namespace, token)`
+/// Data:   `(holder: Address, capped_amount: i128, reclassified_amount: i128)`
+pub const EVENT_TAX_RECLASSIFY: Symbol = symbol_short!("tax_recls");
+
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct TaxBucketResult {
@@ -157,7 +164,11 @@ pub fn update_tax_year_accumulator(
     env.storage().persistent().set(&year_key, &summary);
 }
 
-pub fn rollover_distribution(
+/// Apply return-of-capital with a hard cap at remaining cost basis.
+/// Any excess is reclassified as capital gains.
+/// Emits `EVENT_TAX_RECLASSIFY` when the cap is hit.
+/// Uses checked subtraction to avoid underflow.
+pub fn apply_return_of_capital_with_cap(
     env: &Env,
     offering_id: &OfferingId,
     holder: &Address,
@@ -168,13 +179,46 @@ pub fn rollover_distribution(
     let key = DataKey2::RemainingBasis(offering_id.clone(), holder.clone());
     let remaining_basis: i128 = env.storage().persistent().get(&key).unwrap_or(0);
 
-    let (return_of_capital, capital_gains) = if remaining_basis >= amount {
-        let new_basis = remaining_basis - amount;
+    if remaining_basis <= 0 {
+        let result = TaxBucketResult { return_of_capital: 0, capital_gains: amount };
+        env.events().publish(
+            (
+                EVENT_TAX_LOT_V1,
+                offering_id.issuer.clone(),
+                offering_id.namespace.clone(),
+                offering_id.token.clone(),
+            ),
+            (
+                holder.clone(),
+                result.return_of_capital,
+                result.capital_gains,
+                amount,
+                period_id,
+                timestamp,
+            ),
+        );
+        return result;
+    }
+
+    let (return_of_capital, capital_gains) = if amount <= remaining_basis {
+        let new_basis = remaining_basis.checked_sub(amount).unwrap_or(0);
         env.storage().persistent().set(&key, &new_basis);
         (amount, 0i128)
     } else {
         let roc = remaining_basis;
-        let cg = amount - remaining_basis;
+        let cg = amount.checked_sub(remaining_basis).unwrap_or(0);
+
+        env.storage().persistent().set(&key, &0i128);
+
+        env.events().publish(
+            (
+                EVENT_TAX_RECLASSIFY,
+                offering_id.issuer.clone(),
+                offering_id.namespace.clone(),
+                offering_id.token.clone(),
+            ),
+            (holder.clone(), roc, cg),
+        );
 
         env.events().publish(
             (
@@ -186,11 +230,9 @@ pub fn rollover_distribution(
             (holder.clone(), remaining_basis, 0i128),
         );
 
-        env.storage().persistent().set(&key, &0i128);
         (roc, cg)
     };
 
-    // Emit tax_lot_v1 event for every tax-bucket update
     env.events().publish(
         (
             EVENT_TAX_LOT_V1,
@@ -202,4 +244,159 @@ pub fn rollover_distribution(
     );
 
     TaxBucketResult { return_of_capital, capital_gains }
+}
+
+pub fn rollover_distribution(
+    env: &Env,
+    offering_id: &OfferingId,
+    holder: &Address,
+    amount: i128,
+    period_id: u64,
+    timestamp: u64,
+) -> TaxBucketResult {
+    apply_return_of_capital_with_cap(env, offering_id, holder, amount, period_id, timestamp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::testutils::Events;
+    use soroban_sdk::{symbol_short, Address, Env};
+
+    fn setup_env() -> (Env, OfferingId, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let holder = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let offering_id =
+            OfferingId { issuer, namespace: symbol_short!("def"), token: Address::generate(&env) };
+        (env, offering_id, holder)
+    }
+
+    #[test]
+    fn test_track_and_rollover_within_basis() {
+        let (env, offering_id, holder) = setup_env();
+
+        track_cost_basis(&env, &offering_id, &holder, 100_000);
+        let result = rollover_distribution(&env, &offering_id, &holder, 30_000, 1, 1000);
+
+        assert_eq!(result.return_of_capital, 30_000);
+        assert_eq!(result.capital_gains, 0);
+
+        let key = DataKey2::RemainingBasis(offering_id.clone(), holder.clone());
+        let remaining: i128 = env.storage().persistent().get(&key).unwrap();
+        assert_eq!(remaining, 70_000);
+    }
+
+    #[test]
+    fn test_rollover_exact_basis() {
+        let (env, offering_id, holder) = setup_env();
+
+        track_cost_basis(&env, &offering_id, &holder, 50_000);
+        let result = rollover_distribution(&env, &offering_id, &holder, 50_000, 1, 1000);
+
+        assert_eq!(result.return_of_capital, 50_000);
+        assert_eq!(result.capital_gains, 0);
+
+        let key = DataKey2::RemainingBasis(offering_id.clone(), holder.clone());
+        let remaining: i128 = env.storage().persistent().get(&key).unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn test_rollover_exceeds_basis_emits_reclassify() {
+        let (env, offering_id, holder) = setup_env();
+
+        track_cost_basis(&env, &offering_id, &holder, 30_000);
+        let result = rollover_distribution(&env, &offering_id, &holder, 100_000, 1, 1000);
+
+        assert_eq!(result.return_of_capital, 30_000);
+        assert_eq!(result.capital_gains, 70_000);
+
+        let key = DataKey2::RemainingBasis(offering_id.clone(), holder.clone());
+        let remaining: i128 = env.storage().persistent().get(&key).unwrap();
+        assert_eq!(remaining, 0);
+
+        let events = env.events().all();
+        let reclassify_events = events
+            .iter()
+            .filter(|e| {
+                e.0 == (
+                    EVENT_TAX_RECLASSIFY,
+                    offering_id.issuer.clone(),
+                    offering_id.namespace.clone(),
+                    offering_id.token.clone(),
+                )
+            })
+            .count();
+        assert!(reclassify_events > 0, "expected tax_recls event");
+    }
+
+    #[test]
+    fn test_rollover_zero_basis() {
+        let (env, offering_id, holder) = setup_env();
+
+        let result = rollover_distribution(&env, &offering_id, &holder, 50_000, 1, 1000);
+
+        assert_eq!(result.return_of_capital, 0);
+        assert_eq!(result.capital_gains, 50_000);
+    }
+
+    #[test]
+    fn test_rollover_zero_amount() {
+        let (env, offering_id, holder) = setup_env();
+
+        track_cost_basis(&env, &offering_id, &holder, 100_000);
+        let result = rollover_distribution(&env, &offering_id, &holder, 0, 1, 1000);
+
+        assert_eq!(result.return_of_capital, 0);
+        assert_eq!(result.capital_gains, 0);
+
+        let key = DataKey2::RemainingBasis(offering_id.clone(), holder.clone());
+        let remaining: i128 = env.storage().persistent().get(&key).unwrap();
+        assert_eq!(remaining, 100_000);
+    }
+
+    #[test]
+    fn test_apply_return_of_capital_with_cap_multiple_distributions() {
+        let (env, offering_id, holder) = setup_env();
+
+        track_cost_basis(&env, &offering_id, &holder, 100_000);
+
+        let r1 = apply_return_of_capital_with_cap(&env, &offering_id, &holder, 40_000, 1, 1000);
+        assert_eq!(r1.return_of_capital, 40_000);
+        assert_eq!(r1.capital_gains, 0);
+
+        let r2 = apply_return_of_capital_with_cap(&env, &offering_id, &holder, 30_000, 2, 2000);
+        assert_eq!(r2.return_of_capital, 30_000);
+        assert_eq!(r2.capital_gains, 0);
+
+        let r3 = apply_return_of_capital_with_cap(&env, &offering_id, &holder, 50_000, 3, 3000);
+        assert_eq!(r3.return_of_capital, 30_000);
+        assert_eq!(r3.capital_gains, 20_000);
+
+        let r4 = apply_return_of_capital_with_cap(&env, &offering_id, &holder, 10_000, 4, 4000);
+        assert_eq!(r4.return_of_capital, 0);
+        assert_eq!(r4.capital_gains, 10_000);
+    }
+
+    #[test]
+    fn test_reclassify_event_contains_correct_data() {
+        let (env, offering_id, holder) = setup_env();
+
+        track_cost_basis(&env, &offering_id, &holder, 25_000);
+
+        apply_return_of_capital_with_cap(&env, &offering_id, &holder, 100_000, 1, 5000);
+
+        let events = env.events().all();
+        let found = events.iter().any(|e| {
+            e.0 == (
+                EVENT_TAX_RECLASSIFY,
+                offering_id.issuer.clone(),
+                offering_id.namespace.clone(),
+                offering_id.token.clone(),
+            )
+        });
+        assert!(found, "expected tax_recls event");
+    }
 }
