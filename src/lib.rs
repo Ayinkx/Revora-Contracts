@@ -324,7 +324,8 @@ pub enum RevoraError {
     /// The holder does not have sufficient class balance for the requested operation.
     InsufficientClassBalance = 74,
     /// Current time is outside the configured redemption window.
-    RedemptionWindowClosed = 75,    /// Holder's jurisdiction migration grace period has expired and the
+    RedemptionWindowClosed = 75,
+    /// Holder's jurisdiction migration grace period has expired and the
     /// new jurisdiction is disallowed for this offering. Claims are blocked
     /// until the holder relocates to an allowed jurisdiction or the issuer
     /// updates the allowlist.
@@ -394,6 +395,8 @@ mod test_close_period;
 #[cfg(test)]
 mod test_compute_share_decomposition_prop;
 #[cfg(test)]
+mod test_compute_share_decomposition_prop;
+#[cfg(test)]
 mod test_disclosure;
 #[cfg(test)]
 mod test_faucet_metrics;
@@ -403,9 +406,11 @@ mod test_faucet_seed;
 #[cfg(test)]
 mod test_quorum_check;
 #[cfg(test)]
-mod test_compute_share_decomposition_prop;
-#[cfg(test)]
 mod test_reg_limit_delta;
+#[cfg(test)]
+mod test_accrual_reconciliation_prop;
+#[cfg(test)]
+mod test_tax_year;
 #[cfg(test)]
 mod test_transfer_cooldown;
 
@@ -638,6 +643,11 @@ const EVENT_AUTO_FRZ: Symbol = symbol_short!("auto_frz");
 /// Topic: `(tr_cool_set, issuer, namespace, token)`
 /// Data: `(jurisdiction: Symbol, cooldown_secs: u64)`
 const EVENT_TRANSFER_COOLDOWN_SET: Symbol = symbol_short!("tr_cool");
+
+/// Debug tracing event emitted by `get_holder_accrued_unclaimed`.
+/// Topic: `(acc_snap, issuer, namespace, token)`
+/// Data: `(holder, last_settled_idx, matured_end, accrued_owed, total)`
+const EVENT_ACC_SNAP: Symbol = symbol_short!("acc_snap");
 
 /// ── Regulatory-limit delta event (reg_limit_delta event stream) ──
 ///
@@ -1623,8 +1633,15 @@ pub enum DataKey2 {
     /// Per-entry faucet seed for testnet holder seeding.
     FaucetSeedEntry(OfferingId, u32),
     /// Running count of faucet seed slots generated for an offering; used by faucet_reset
-    /// to know how many FaucetSeedEntry keys to clear without unbounded iteration.
     FaucetSeedCount(OfferingId),
+
+    /// Per-offering fiscal year start month (1-12, default 1 = January).
+    /// Used by `get_holder_tax_year` to determine which fiscal year a payout
+    /// timestamp belongs to.
+    FiscalYearStartMonth(OfferingId),
+    /// Per-holder, per-fiscal-year accumulated tax summary.
+    /// Updated on every claim via `rollover_distribution`.
+    TaxYearEntry(OfferingId, Address, u64),
 
     // ── Multisig keys ──
     /// Multisig approval threshold.
@@ -3475,7 +3492,14 @@ impl RevoraRevenueShare {
         Self::emit_v2_event(
             &env,
             (EVENT_ROYALTY_PAID, issuer.clone(), namespace.clone(), token.clone()),
-            (payer.clone(), seller.clone(), buyer.clone(), payment_asset.clone(), amount, royalty_amount),
+            (
+                payer.clone(),
+                seller.clone(),
+                buyer.clone(),
+                payment_asset.clone(),
+                amount,
+                royalty_amount,
+            ),
         );
         env.events().publish(
             (EVENT_ROYALTY_PAID, issuer, namespace, token),
@@ -7066,7 +7090,9 @@ impl RevoraRevenueShare {
         }
 
         // Lockup violation check: reject transfer if lockup is still active
-        if let Some(schedule) = Self::get_lockup_schedule(env.clone(), issuer.clone(), namespace.clone(), token.clone()) {
+        if let Some(schedule) =
+            Self::get_lockup_schedule(env.clone(), issuer.clone(), namespace.clone(), token.clone())
+        {
             let now = env.ledger().timestamp();
             let unlocked_bps = schedule.calculate_unlocked_bps(now);
             if unlocked_bps < 10_000 {
@@ -7084,20 +7110,27 @@ impl RevoraRevenueShare {
         }
 
         // Blacklist check
-        if Self::is_blacklisted(env.clone(), issuer.clone(), namespace.clone(), token.clone(), from.clone()) {
+        if Self::is_blacklisted(
+            env.clone(),
+            issuer.clone(),
+            namespace.clone(),
+            token.clone(),
+            from.clone(),
+        ) {
             return Err(RevoraError::HolderBlacklisted);
         }
-        if Self::is_blacklisted(env.clone(), issuer.clone(), namespace.clone(), token.clone(), to.clone()) {
+        if Self::is_blacklisted(
+            env.clone(),
+            issuer.clone(),
+            namespace.clone(),
+            token.clone(),
+            to.clone(),
+        ) {
             return Err(RevoraError::HolderBlacklisted);
         }
 
         // Jurisdiction block
-        Self::require_holder_jurisdiction_allowed(
-            env,
-            &offering_id,
-            to,
-            symbol_short!("xfer"),
-        )?;
+        Self::require_holder_jurisdiction_allowed(env, &offering_id, to, symbol_short!("xfer"))?;
 
         let from_share: u32 = env
             .storage()
@@ -7149,7 +7182,8 @@ impl RevoraRevenueShare {
         let jurisdiction = Self::get_holder_jurisdiction_internal(&env, &offering_id, &from);
         if let Some(jur) = jurisdiction {
             if jur != EVENT_JUR_UNSET {
-                let cooldown_key = DataKey2::TransferCooldownConfig(offering_id.clone(), jur.clone());
+                let cooldown_key =
+                    DataKey2::TransferCooldownConfig(offering_id.clone(), jur.clone());
                 if let Some(cooldown_secs) =
                     env.storage().persistent().get::<DataKey2, u64>(&cooldown_key)
                 {
@@ -7215,23 +7249,32 @@ impl RevoraRevenueShare {
         }
 
         // Blacklist check
-        if Self::is_blacklisted(env.clone(), issuer.clone(), namespace.clone(), token.clone(), from.clone()) {
+        if Self::is_blacklisted(
+            env.clone(),
+            issuer.clone(),
+            namespace.clone(),
+            token.clone(),
+            from.clone(),
+        ) {
             return Err(RevoraError::HolderBlacklisted);
         }
-        if Self::is_blacklisted(env.clone(), issuer.clone(), namespace.clone(), token.clone(), to.clone()) {
+        if Self::is_blacklisted(
+            env.clone(),
+            issuer.clone(),
+            namespace.clone(),
+            token.clone(),
+            to.clone(),
+        ) {
             return Err(RevoraError::HolderBlacklisted);
         }
 
         // Jurisdiction block
-        Self::require_holder_jurisdiction_allowed(
-            env,
-            &offering_id,
-            to,
-            symbol_short!("xfer"),
-        )?;
+        Self::require_holder_jurisdiction_allowed(env, &offering_id, to, symbol_short!("xfer"))?;
 
         // Lockup violation check: reject transfer if lockup is still active
-        if let Some(schedule) = Self::get_lockup_schedule(env.clone(), issuer.clone(), namespace.clone(), token.clone()) {
+        if let Some(schedule) =
+            Self::get_lockup_schedule(env.clone(), issuer.clone(), namespace.clone(), token.clone())
+        {
             let now = env.ledger().timestamp();
             let unlocked_bps = schedule.calculate_unlocked_bps(now);
             if unlocked_bps < 10_000 {
@@ -7292,7 +7335,8 @@ impl RevoraRevenueShare {
         let jurisdiction = Self::get_holder_jurisdiction_internal(env, &offering_id, from);
         if let Some(jur) = jurisdiction {
             if jur != EVENT_JUR_UNSET {
-                let cooldown_key = DataKey2::TransferCooldownConfig(offering_id.clone(), jur.clone());
+                let cooldown_key =
+                    DataKey2::TransferCooldownConfig(offering_id.clone(), jur.clone());
                 if let Some(cooldown_secs) =
                     env.storage().persistent().get::<DataKey2, u64>(&cooldown_key)
                 {
@@ -7323,7 +7367,9 @@ impl RevoraRevenueShare {
         amount_bps: u32,
         category: Symbol,
     ) -> Result<(), RevoraError> {
-        Self::check_transfer_eligibility(&env, &issuer, &namespace, &token, &from, &to, amount_bps, &category)?;
+        Self::check_transfer_eligibility(
+            &env, &issuer, &namespace, &token, &from, &to, amount_bps, &category,
+        )?;
         issuer.require_auth();
 
         let offering_id = OfferingId {
@@ -7383,7 +7429,8 @@ impl RevoraRevenueShare {
         let jurisdiction = Self::get_holder_jurisdiction_internal(&env, &offering_id, &from);
         if let Some(jur) = jurisdiction {
             if jur != EVENT_JUR_UNSET {
-                let cooldown_key = DataKey2::TransferCooldownConfig(offering_id.clone(), jur.clone());
+                let cooldown_key =
+                    DataKey2::TransferCooldownConfig(offering_id.clone(), jur.clone());
                 if let Some(cooldown_secs) =
                     env.storage().persistent().get::<DataKey2, u64>(&cooldown_key)
                 {
@@ -7449,23 +7496,32 @@ impl RevoraRevenueShare {
         }
 
         // Blacklist check
-        if Self::is_blacklisted(env.clone(), issuer.clone(), namespace.clone(), token.clone(), from.clone()) {
+        if Self::is_blacklisted(
+            env.clone(),
+            issuer.clone(),
+            namespace.clone(),
+            token.clone(),
+            from.clone(),
+        ) {
             return Err(RevoraError::HolderBlacklisted);
         }
-        if Self::is_blacklisted(env.clone(), issuer.clone(), namespace.clone(), token.clone(), to.clone()) {
+        if Self::is_blacklisted(
+            env.clone(),
+            issuer.clone(),
+            namespace.clone(),
+            token.clone(),
+            to.clone(),
+        ) {
             return Err(RevoraError::HolderBlacklisted);
         }
 
         // Jurisdiction block
-        Self::require_holder_jurisdiction_allowed(
-            env,
-            &offering_id,
-            to,
-            symbol_short!("xfer"),
-        )?;
+        Self::require_holder_jurisdiction_allowed(env, &offering_id, to, symbol_short!("xfer"))?;
 
         // Lockup violation check: reject transfer if lockup is still active
-        if let Some(schedule) = Self::get_lockup_schedule(env.clone(), issuer.clone(), namespace.clone(), token.clone()) {
+        if let Some(schedule) =
+            Self::get_lockup_schedule(env.clone(), issuer.clone(), namespace.clone(), token.clone())
+        {
             let now = env.ledger().timestamp();
             let unlocked_bps = schedule.calculate_unlocked_bps(now);
             if unlocked_bps < 10_000 {
@@ -7526,7 +7582,8 @@ impl RevoraRevenueShare {
         let jurisdiction = Self::get_holder_jurisdiction_internal(env, &offering_id, from);
         if let Some(jur) = jurisdiction {
             if jur != EVENT_JUR_UNSET {
-                let cooldown_key = DataKey2::TransferCooldownConfig(offering_id.clone(), jur.clone());
+                let cooldown_key =
+                    DataKey2::TransferCooldownConfig(offering_id.clone(), jur.clone());
                 if let Some(cooldown_secs) =
                     env.storage().persistent().get::<DataKey2, u64>(&cooldown_key)
                 {
@@ -7594,7 +7651,8 @@ impl RevoraRevenueShare {
         };
 
         // Offering-level freeze check
-        if env.storage()
+        if env
+            .storage()
             .persistent()
             .get::<DataKey2, bool>(&DataKey2::FrozenOffering(offering_id.clone()))
             .unwrap_or(false)
@@ -7665,7 +7723,8 @@ impl RevoraRevenueShare {
         }
 
         // Whitelist enforcement
-        if Self::is_whitelist_enabled(env.clone(), issuer.clone(), namespace.clone(), token.clone()) {
+        if Self::is_whitelist_enabled(env.clone(), issuer.clone(), namespace.clone(), token.clone())
+        {
             if !Self::is_whitelisted(
                 env.clone(),
                 issuer.clone(),
@@ -7684,7 +7743,12 @@ impl RevoraRevenueShare {
         }
 
         // Jurisdiction block
-        Self::require_holder_jurisdiction_allowed(env.clone(), &offering_id, to.clone(), symbol_short!("xfer"))?;
+        Self::require_holder_jurisdiction_allowed(
+            env.clone(),
+            &offering_id,
+            to.clone(),
+            symbol_short!("xfer"),
+        )?;
 
         let from_share: u32 = env
             .storage()
@@ -7716,7 +7780,16 @@ impl RevoraRevenueShare {
             None,
             None,
         )?;
-        Self::set_holder_share_internal(&env, issuer, namespace, token, to, to_share + amount_bps, None, None)?;
+        Self::set_holder_share_internal(
+            &env,
+            issuer,
+            namespace,
+            token,
+            to,
+            to_share + amount_bps,
+            None,
+            None,
+        )?;
 
         // ── Record last transfer timestamp for cooldown enforcement ──
         // Update the `from` holder's last transfer timestamp so that subsequent
@@ -7828,8 +7901,9 @@ impl RevoraRevenueShare {
         }
 
         // Step 2 — the digest must match the canonical preimage for these parameters.
-        let expected =
-            Self::build_attestation_digest(&env, &issuer, &namespace, &token, &from, &to, amount_bps);
+        let expected = Self::build_attestation_digest(
+            &env, &issuer, &namespace, &token, &from, &to, amount_bps,
+        );
         if attestation.digest != expected {
             return Err(RevoraError::NetworkIdMismatch);
         }
@@ -7870,7 +7944,6 @@ impl RevoraRevenueShare {
 
         env.crypto().sha256(&preimage)
     }
-
 
     /// Report the current top-holder concentration for an offering.
     ///
@@ -9493,11 +9566,7 @@ impl RevoraRevenueShare {
         token: Address,
         jurisdiction: Symbol,
     ) -> u64 {
-        let offering_id = OfferingId {
-            issuer,
-            namespace,
-            token,
-        };
+        let offering_id = OfferingId { issuer, namespace, token };
         let key = DataKey2::TransferCooldownConfig(offering_id, jurisdiction);
         env.storage().persistent().get::<DataKey2, u64>(&key).unwrap_or(0)
     }
@@ -9967,7 +10036,7 @@ impl RevoraRevenueShare {
         }
 
         if total_payout > 0 {
-            crate::tax_bucket::rollover_distribution(
+            let bucket = crate::tax_bucket::rollover_distribution(
                 &env,
                 &offering_id,
                 &holder,
@@ -9975,6 +10044,22 @@ impl RevoraRevenueShare {
                 previous_period_id
                     .expect("rollover_distribution called with zero claimed periods; total_payout > 0 invariant broken"),
                 now,
+            );
+            // Update the per-fiscal-year tax accumulator for year-end queries.
+            let fiscal_start_month = env
+                .storage()
+                .persistent()
+                .get::<_, u32>(&DataKey2::FiscalYearStartMonth(offering_id.clone()))
+                .unwrap_or(crate::tax_bucket::DEFAULT_FISCAL_START_MONTH);
+            let fy = crate::tax_bucket::fiscal_year_from_ts(now, fiscal_start_month);
+            crate::tax_bucket::update_tax_year_accumulator(
+                &env,
+                &offering_id,
+                &holder,
+                fy,
+                0, // ordinary_income — reserved; currently always 0
+                bucket.capital_gains,
+                bucket.return_of_capital,
             );
         }
 
@@ -12252,7 +12337,181 @@ impl RevoraRevenueShare {
         Self::compute_claimable_preview(&env, &offering_id, &holder, start_idx, Some(count))
     }
 
-    // â”€â”€ Time-delayed claim configuration (#27) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    /// Per-holder accrual snapshot: returns the total unclaimed dividend balance
+    /// across all periods by walking the accrual ledger since the holder's last
+    /// claim checkpoint.
+    ///
+    /// This is a pure read-only query and does not mutate contract state.
+    /// The computation is bounded per-holder; it walks only the holder's share
+    /// schedule entries and accrual-index snapshots between `last_settled_idx`
+    /// and the current matured end, without iterating every period individually
+    /// through a per-period loop.
+    ///
+    /// # Arguments
+    ///
+    /// * `issuer`    — The offering issuer address.
+    /// * `namespace` — The offering namespace identifier.
+    /// * `token`     — The offering token address.
+    /// * `holder`    — The holder address to compute accrued unclaimed for.
+    ///
+    /// # Returns
+    ///
+    /// Returns `i128` — the total amount currently accrued but unclaimed for this
+    /// holder. Returns `0` for blacklisted holders or holders with no unclaimed
+    /// periods.
+    ///
+    /// # Gas
+    ///
+    /// Gas scales with the number of share-schedule entries (share changes) and
+    /// the number of periods since the last settlement. Both are naturally bounded
+    /// by checkpoint compression (default threshold: 1 000 schedule entries) and
+    /// the offering's total period count.
+    pub fn get_holder_accrued_unclaimed(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        holder: Address,
+    ) -> i128 {
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+
+        // Fast-path: blacklisted holders always return 0.
+        if Self::is_blacklisted(env.clone(), issuer, namespace, token, holder.clone()) {
+            return 0;
+        }
+
+        // Get the holder's current accrual state.  This includes the frozen
+        // `accrued_owed` from previous share-change settlements and correctly
+        // advances `last_settled_idx` past any `last_claimed_idx` advances.
+        let state = Self::get_holder_accrual_state(&env, &offering_id, &holder);
+
+        // Find how many periods have matured beyond their claim delay (if any).
+        let matured_end =
+            Self::find_matured_claim_end_idx(&env, &offering_id, state.last_settled_idx);
+
+        // Start total from already-frozen accrued_owed.
+        let mut total = state.accrued_owed;
+
+        // Compute additional accrual for periods since the last settlement.
+        if matured_end > state.last_settled_idx {
+            total = total.saturating_add(Self::compute_holder_payout_for_range(
+                &env,
+                &offering_id,
+                &holder,
+                state.last_settled_idx,
+                matured_end,
+            ));
+        }
+
+        // Handle accrual anchor: compressed share-schedule entries that were
+        // folded into a pre-computed sum during checkpoint compression.  The
+        // anchor must be included if it covers periods after the last claim,
+        // even though those entries have been pruned from the live schedule.
+        let anchor_key = DataKey2::AccrualAnchor(offering_id.clone(), holder.clone());
+        if let Some(anchor) = env.storage().persistent().get::<_, AccrualAnchor>(&anchor_key) {
+            let last_claimed_idx: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::LastClaimedIdx(offering_id.clone(), holder.clone()))
+                .unwrap_or(0);
+            if last_claimed_idx <= anchor.end_idx {
+                total = total.saturating_add(anchor.claimable_sum);
+            }
+        }
+
+        // Emit debug tracing event.  Even though this is a read-only query,
+        // the event is visible in simulation responses, giving integrators
+        // full visibility into the computation breakdown.
+        env.events().publish(
+            (EVENT_ACC_SNAP, offering_id.issuer, offering_id.namespace, offering_id.token),
+            (holder.clone(), state.last_settled_idx, matured_end, state.accrued_owed, total),
+        );
+
+        total
+    }
+
+    // ââ Fiscal year configuration âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+
+    /// Set the fiscal year start month for an offering.
+    ///
+    /// `month` must be 1 (January) through 12 (December).  The default is 1.
+    /// This determines how `get_holder_tax_year` maps payout timestamps to
+    /// fiscal years.
+    ///
+    /// # Access
+    /// Issuer-only (requires `require_issuer_quorum_auth`).
+    pub fn set_fiscal_year_start(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        month: u32,
+    ) -> Result<(), RevoraError> {
+        if month < 1 || month > 12 {
+            return Err(RevoraError::InvalidAmount);
+        }
+        let offering =
+            Self::get_offering(env.clone(), issuer.clone(), namespace.clone(), token.clone())
+                .ok_or(RevoraError::OfferingNotFound)?;
+        Self::require_issuer_quorum_auth(&env, &offering.issuers);
+
+        let offering_id = OfferingId { issuer, namespace, token };
+        env.storage().persistent().set(&DataKey2::FiscalYearStartMonth(offering_id), &month);
+        Ok(())
+    }
+
+    /// Read the fiscal year start month for an offering.
+    /// Returns 1 (January) if not configured.
+    pub fn get_fiscal_year_start(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+    ) -> u32 {
+        let offering_id = OfferingId { issuer, namespace, token };
+        env.storage()
+            .persistent()
+            .get::<_, u32>(&DataKey2::FiscalYearStartMonth(offering_id))
+            .unwrap_or(crate::tax_bucket::DEFAULT_FISCAL_START_MONTH)
+    }
+
+    /// Return the per-holder tax-year summary for a given fiscal year.
+    ///
+    /// The summary is accumulated on every `claim` and stored per offering,
+    /// per holder, per fiscal year.  Returns a `TaxYearSummary` with
+    /// `return_of_capital` and `capital_gains` totals for the requested year.
+    ///
+    /// The fiscal year is determined by the offering's configured fiscal year
+    /// start month (see `set_fiscal_year_start`).  If the start month is
+    /// April (4), then fiscal year 2024 covers Apr 2024 â Mar 2025.
+    ///
+    /// # Returns
+    /// A `TaxYearSummary` â never fails; returns zero-filled record for holders
+    /// with no activity in the given year.
+    pub fn get_holder_tax_year(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        holder: Address,
+        year: u64,
+    ) -> crate::tax_bucket::TaxYearSummary {
+        let offering_id = OfferingId { issuer, namespace, token };
+        env.storage()
+            .persistent()
+            .get(&DataKey2::TaxYearEntry(offering_id, holder, year))
+            .unwrap_or(crate::tax_bucket::TaxYearSummary {
+                ordinary_income: 0,
+                capital_gains: 0,
+                return_of_capital: 0,
+            })
+    }
+
+    // ââ Time-delayed claim configuration (#27) âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
     /// Set the claim delay for an offering in seconds.
     fn set_claim_delay_full(
@@ -13106,10 +13365,8 @@ impl RevoraRevenueShare {
         if new_mask == 0 {
             // All reasons cleared — full unfreeze.
             env.storage().persistent().remove(&key);
-            env.events().publish(
-                (EVENT_FRZ_CLR, issuer, namespace, token),
-                (caller, holder, reason),
-            );
+            env.events()
+                .publish((EVENT_FRZ_CLR, issuer, namespace, token), (caller, holder, reason));
         } else {
             // Partial unfreeze — update mask and emit scoped event.
             env.storage().persistent().set(&key, &new_mask);
@@ -13154,10 +13411,7 @@ impl RevoraRevenueShare {
             .unwrap_or_else(|| {
                 env.storage()
                     .persistent()
-                    .get::<DataKey2, FreezeReason>(&DataKey2::EmergencyFreeze(
-                        offering_id,
-                        holder,
-                    ))
+                    .get::<DataKey2, FreezeReason>(&DataKey2::EmergencyFreeze(offering_id, holder))
                     .map(|r| r.to_bitmask())
                     .unwrap_or(0)
             });
@@ -13182,10 +13436,7 @@ impl RevoraRevenueShare {
             .unwrap_or_else(|| {
                 env.storage()
                     .persistent()
-                    .get::<DataKey2, FreezeReason>(&DataKey2::EmergencyFreeze(
-                        offering_id,
-                        holder,
-                    ))
+                    .get::<DataKey2, FreezeReason>(&DataKey2::EmergencyFreeze(offering_id, holder))
                     .map(|r| r.to_bitmask())
                     .unwrap_or(0)
             })
@@ -13899,11 +14150,8 @@ impl RevoraRevenueShare {
         }
 
         // ── Admin authorisation ───────────────────────────────────────────────
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .ok_or(RevoraError::NotInitialized)?;
+        let admin: Address =
+            env.storage().persistent().get(&DataKey::Admin).ok_or(RevoraError::NotInitialized)?;
         admin.require_auth();
         if caller != admin {
             return Err(RevoraError::NotAuthorized);
@@ -13915,11 +14163,7 @@ impl RevoraRevenueShare {
             namespace: namespace.clone(),
             token: token.clone(),
         };
-        if !env
-            .storage()
-            .persistent()
-            .has(&DataKey2::OfferingRecord(offering_id.clone()))
-        {
+        if !env.storage().persistent().has(&DataKey2::OfferingRecord(offering_id.clone())) {
             return Err(RevoraError::OfferingNotFound);
         }
 
@@ -13934,9 +14178,7 @@ impl RevoraRevenueShare {
             .unwrap_or(0);
 
         for idx in 0..seed_count {
-            env.storage()
-                .persistent()
-                .remove(&DataKey2::FaucetSeedEntry(offering_id.clone(), idx));
+            env.storage().persistent().remove(&DataKey2::FaucetSeedEntry(offering_id.clone(), idx));
         }
 
         // Reset the seed count to 0 so future faucet_seed_holders calls start fresh.
@@ -13946,12 +14188,7 @@ impl RevoraRevenueShare {
 
         // ── Emit reset event ──────────────────────────────────────────────────
         env.events().publish(
-            (
-                EVENT_FAUCET_RESET,
-                issuer.clone(),
-                namespace.clone(),
-                token.clone(),
-            ),
+            (EVENT_FAUCET_RESET, issuer.clone(), namespace.clone(), token.clone()),
             (caller, seed, seed_count),
         );
 
@@ -15284,7 +15521,6 @@ impl RevoraRevenueShare {
         }
     }
 
-
     // ── Merkle proof verification ────────────────────────────────────────────
 
     /// Verify a Merkle membership proof against a known root.
@@ -15339,15 +15575,12 @@ impl RevoraRevenueShare {
         // This mirrors the check inside `merkle_verify_proof` but also emits the
         // structured event required by the contract API contract.
         if proof.len() > MAX_PROOF_DEPTH {
-            env.events().publish(
-                (EVENT_PROOF_REJECT_DEPTH, caller),
-                (proof.len(), MAX_PROOF_DEPTH),
-            );
+            env.events()
+                .publish((EVENT_PROOF_REJECT_DEPTH, caller), (proof.len(), MAX_PROOF_DEPTH));
             return Err(RevoraError::ProofTooDeep);
         }
 
-        merkle_verify_proof(&env, leaf_hash, root, &proof)
-            .map_err(|_e| RevoraError::ProofTooDeep)
+        merkle_verify_proof(&env, leaf_hash, root, &proof).map_err(|_e| RevoraError::ProofTooDeep)
     }
 
     /// Execute the storage walker migration from `from_version` to `to_version`.
@@ -15445,310 +15678,309 @@ impl RevoraRevenueShare {
 }
 
 impl RevoraRevenueShare {
+    // ── Indexer fixture topics ────────────────────────────────────────────────────
 
-// ── Indexer fixture topics ────────────────────────────────────────────────────
+    /// Returns canonical fixture topics for indexer schema bootstrapping.
+    ///
+    /// Returns a pair `(v2_fixtures, v3_fixtures)` where each Vec has the same
+    /// length and stable ordering. Off-chain indexers can subscribe to these
+    /// known topic symbols to ensure their parser correctly deserializes every
+    /// event type the contract emits.
+    ///
+    /// The `period_id` parameter is used for period-scoped event types (e.g.
+    /// `rv_init`, `rv_rep`). Non-period-scoped events (e.g. `offer`, `claim`,
+    /// `ms_init`, `rg_lim_d`) always carry `period_id = 0`.
+    pub fn get_indexer_fixture_topics(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        period_id: u64,
+    ) -> (Vec<EventIndexTopicV2>, Vec<EventIndexTopicV3>) {
+        let v2_fixtures: Vec<EventIndexTopicV2> = soroban_sdk::vec![
+            &env,
+            EventIndexTopicV2 {
+                version: EVENT_SCHEMA_VERSION_V2,
+                event_type: symbol_short!("offer"),
+                issuer: issuer.clone(),
+                namespace: namespace.clone(),
+                token: token.clone(),
+                period_id: 0,
+            },
+            EventIndexTopicV2 {
+                version: EVENT_SCHEMA_VERSION_V2,
+                event_type: symbol_short!("rv_init"),
+                issuer: issuer.clone(),
+                namespace: namespace.clone(),
+                token: token.clone(),
+                period_id,
+            },
+            EventIndexTopicV2 {
+                version: EVENT_SCHEMA_VERSION_V2,
+                event_type: symbol_short!("rv_ovr"),
+                issuer: issuer.clone(),
+                namespace: namespace.clone(),
+                token: token.clone(),
+                period_id,
+            },
+            EventIndexTopicV2 {
+                version: EVENT_SCHEMA_VERSION_V2,
+                event_type: symbol_short!("rv_rej"),
+                issuer: issuer.clone(),
+                namespace: namespace.clone(),
+                token: token.clone(),
+                period_id,
+            },
+            EventIndexTopicV2 {
+                version: EVENT_SCHEMA_VERSION_V2,
+                event_type: symbol_short!("rv_rep"),
+                issuer: issuer.clone(),
+                namespace: namespace.clone(),
+                token: token.clone(),
+                period_id,
+            },
+            EventIndexTopicV2 {
+                version: EVENT_SCHEMA_VERSION_V2,
+                event_type: symbol_short!("claim"),
+                issuer: issuer.clone(),
+                namespace: namespace.clone(),
+                token: token.clone(),
+                period_id: 0,
+            },
+            EventIndexTopicV2 {
+                version: EVENT_SCHEMA_VERSION_V2,
+                event_type: symbol_short!("admin_set"),
+                issuer: issuer.clone(),
+                namespace: namespace.clone(),
+                token: token.clone(),
+                period_id: 0,
+            },
+            EventIndexTopicV2 {
+                version: EVENT_SCHEMA_VERSION_V2,
+                event_type: symbol_short!("fee_set"),
+                issuer: issuer.clone(),
+                namespace: namespace.clone(),
+                token: token.clone(),
+                period_id: 0,
+            },
+            EventIndexTopicV2 {
+                version: EVENT_SCHEMA_VERSION_V2,
+                event_type: symbol_short!("fee_ast"),
+                issuer: issuer.clone(),
+                namespace: namespace.clone(),
+                token: token.clone(),
+                period_id: 0,
+            },
+            EventIndexTopicV2 {
+                version: EVENT_SCHEMA_VERSION_V2,
+                event_type: symbol_short!("fee_off"),
+                issuer: issuer.clone(),
+                namespace: namespace.clone(),
+                token: token.clone(),
+                period_id: 0,
+            },
+            EventIndexTopicV2 {
+                version: EVENT_SCHEMA_VERSION_V2,
+                event_type: symbol_short!("conc_lim"),
+                issuer: issuer.clone(),
+                namespace: namespace.clone(),
+                token: token.clone(),
+                period_id: 0,
+            },
+            EventIndexTopicV2 {
+                version: EVENT_SCHEMA_VERSION_V2,
+                event_type: symbol_short!("rnd_mode"),
+                issuer: issuer.clone(),
+                namespace: namespace.clone(),
+                token: token.clone(),
+                period_id: 0,
+            },
+            EventIndexTopicV2 {
+                version: EVENT_SCHEMA_VERSION_V2,
+                event_type: symbol_short!("meta_key"),
+                issuer: issuer.clone(),
+                namespace: namespace.clone(),
+                token: token.clone(),
+                period_id: 0,
+            },
+            EventIndexTopicV2 {
+                version: EVENT_SCHEMA_VERSION_V2,
+                event_type: symbol_short!("meta_del"),
+                issuer: issuer.clone(),
+                namespace: namespace.clone(),
+                token: token.clone(),
+                period_id: 0,
+            },
+            EventIndexTopicV2 {
+                version: EVENT_SCHEMA_VERSION_V2,
+                event_type: symbol_short!("ms_init"),
+                issuer: issuer.clone(),
+                namespace: namespace.clone(),
+                token: token.clone(),
+                period_id: 0,
+            },
+            // ── Regulatory-limit delta (reg_limit_delta event stream) ──
+            EventIndexTopicV2 {
+                version: EVENT_SCHEMA_VERSION_V2,
+                event_type: symbol_short!("rg_lim_d"),
+                issuer: issuer.clone(),
+                namespace: namespace.clone(),
+                token: token.clone(),
+                period_id: 0,
+            },
+        ];
 
-/// Returns canonical fixture topics for indexer schema bootstrapping.
-///
-/// Returns a pair `(v2_fixtures, v3_fixtures)` where each Vec has the same
-/// length and stable ordering. Off-chain indexers can subscribe to these
-/// known topic symbols to ensure their parser correctly deserializes every
-/// event type the contract emits.
-///
-/// The `period_id` parameter is used for period-scoped event types (e.g.
-/// `rv_init`, `rv_rep`). Non-period-scoped events (e.g. `offer`, `claim`,
-/// `ms_init`, `rg_lim_d`) always carry `period_id = 0`.
-pub fn get_indexer_fixture_topics(
-    env: Env,
-    issuer: Address,
-    namespace: Symbol,
-    token: Address,
-    period_id: u64,
-) -> (Vec<EventIndexTopicV2>, Vec<EventIndexTopicV3>) {
-    let v2_fixtures: Vec<EventIndexTopicV2> = soroban_sdk::vec![
-        &env,
-        EventIndexTopicV2 {
-            version: EVENT_SCHEMA_VERSION_V2,
-            event_type: symbol_short!("offer"),
-            issuer: issuer.clone(),
-            namespace: namespace.clone(),
-            token: token.clone(),
-            period_id: 0,
-        },
-        EventIndexTopicV2 {
-            version: EVENT_SCHEMA_VERSION_V2,
-            event_type: symbol_short!("rv_init"),
-            issuer: issuer.clone(),
-            namespace: namespace.clone(),
-            token: token.clone(),
-            period_id,
-        },
-        EventIndexTopicV2 {
-            version: EVENT_SCHEMA_VERSION_V2,
-            event_type: symbol_short!("rv_ovr"),
-            issuer: issuer.clone(),
-            namespace: namespace.clone(),
-            token: token.clone(),
-            period_id,
-        },
-        EventIndexTopicV2 {
-            version: EVENT_SCHEMA_VERSION_V2,
-            event_type: symbol_short!("rv_rej"),
-            issuer: issuer.clone(),
-            namespace: namespace.clone(),
-            token: token.clone(),
-            period_id,
-        },
-        EventIndexTopicV2 {
-            version: EVENT_SCHEMA_VERSION_V2,
-            event_type: symbol_short!("rv_rep"),
-            issuer: issuer.clone(),
-            namespace: namespace.clone(),
-            token: token.clone(),
-            period_id,
-        },
-        EventIndexTopicV2 {
-            version: EVENT_SCHEMA_VERSION_V2,
-            event_type: symbol_short!("claim"),
-            issuer: issuer.clone(),
-            namespace: namespace.clone(),
-            token: token.clone(),
-            period_id: 0,
-        },
-        EventIndexTopicV2 {
-            version: EVENT_SCHEMA_VERSION_V2,
-            event_type: symbol_short!("admin_set"),
-            issuer: issuer.clone(),
-            namespace: namespace.clone(),
-            token: token.clone(),
-            period_id: 0,
-        },
-        EventIndexTopicV2 {
-            version: EVENT_SCHEMA_VERSION_V2,
-            event_type: symbol_short!("fee_set"),
-            issuer: issuer.clone(),
-            namespace: namespace.clone(),
-            token: token.clone(),
-            period_id: 0,
-        },
-        EventIndexTopicV2 {
-            version: EVENT_SCHEMA_VERSION_V2,
-            event_type: symbol_short!("fee_ast"),
-            issuer: issuer.clone(),
-            namespace: namespace.clone(),
-            token: token.clone(),
-            period_id: 0,
-        },
-        EventIndexTopicV2 {
-            version: EVENT_SCHEMA_VERSION_V2,
-            event_type: symbol_short!("fee_off"),
-            issuer: issuer.clone(),
-            namespace: namespace.clone(),
-            token: token.clone(),
-            period_id: 0,
-        },
-        EventIndexTopicV2 {
-            version: EVENT_SCHEMA_VERSION_V2,
-            event_type: symbol_short!("conc_lim"),
-            issuer: issuer.clone(),
-            namespace: namespace.clone(),
-            token: token.clone(),
-            period_id: 0,
-        },
-        EventIndexTopicV2 {
-            version: EVENT_SCHEMA_VERSION_V2,
-            event_type: symbol_short!("rnd_mode"),
-            issuer: issuer.clone(),
-            namespace: namespace.clone(),
-            token: token.clone(),
-            period_id: 0,
-        },
-        EventIndexTopicV2 {
-            version: EVENT_SCHEMA_VERSION_V2,
-            event_type: symbol_short!("meta_key"),
-            issuer: issuer.clone(),
-            namespace: namespace.clone(),
-            token: token.clone(),
-            period_id: 0,
-        },
-        EventIndexTopicV2 {
-            version: EVENT_SCHEMA_VERSION_V2,
-            event_type: symbol_short!("meta_del"),
-            issuer: issuer.clone(),
-            namespace: namespace.clone(),
-            token: token.clone(),
-            period_id: 0,
-        },
-        EventIndexTopicV2 {
-            version: EVENT_SCHEMA_VERSION_V2,
-            event_type: symbol_short!("ms_init"),
-            issuer: issuer.clone(),
-            namespace: namespace.clone(),
-            token: token.clone(),
-            period_id: 0,
-        },
-        // ── Regulatory-limit delta (reg_limit_delta event stream) ──
-        EventIndexTopicV2 {
-            version: EVENT_SCHEMA_VERSION_V2,
-            event_type: symbol_short!("rg_lim_d"),
-            issuer: issuer.clone(),
-            namespace: namespace.clone(),
-            token: token.clone(),
-            period_id: 0,
-        },
-    ];
+        let v3_fixtures: Vec<EventIndexTopicV3> = soroban_sdk::vec![
+            &env,
+            EventIndexTopicV3 {
+                version: INDEXER_EVENT_SCHEMA_VERSION,
+                event_type: symbol_short!("offer"),
+                issuer: issuer.clone(),
+                namespace: namespace.clone(),
+                token: token.clone(),
+                period_id: 0,
+                _reserved: 0,
+            },
+            EventIndexTopicV3 {
+                version: INDEXER_EVENT_SCHEMA_VERSION,
+                event_type: symbol_short!("rv_init"),
+                issuer: issuer.clone(),
+                namespace: namespace.clone(),
+                token: token.clone(),
+                period_id,
+                _reserved: 0,
+            },
+            EventIndexTopicV3 {
+                version: INDEXER_EVENT_SCHEMA_VERSION,
+                event_type: symbol_short!("rv_ovr"),
+                issuer: issuer.clone(),
+                namespace: namespace.clone(),
+                token: token.clone(),
+                period_id,
+                _reserved: 0,
+            },
+            EventIndexTopicV3 {
+                version: INDEXER_EVENT_SCHEMA_VERSION,
+                event_type: symbol_short!("rv_rej"),
+                issuer: issuer.clone(),
+                namespace: namespace.clone(),
+                token: token.clone(),
+                period_id,
+                _reserved: 0,
+            },
+            EventIndexTopicV3 {
+                version: INDEXER_EVENT_SCHEMA_VERSION,
+                event_type: symbol_short!("rv_rep"),
+                issuer: issuer.clone(),
+                namespace: namespace.clone(),
+                token: token.clone(),
+                period_id,
+                _reserved: 0,
+            },
+            EventIndexTopicV3 {
+                version: INDEXER_EVENT_SCHEMA_VERSION,
+                event_type: symbol_short!("claim"),
+                issuer: issuer.clone(),
+                namespace: namespace.clone(),
+                token: token.clone(),
+                period_id: 0,
+                _reserved: 0,
+            },
+            EventIndexTopicV3 {
+                version: INDEXER_EVENT_SCHEMA_VERSION,
+                event_type: symbol_short!("admin_set"),
+                issuer: issuer.clone(),
+                namespace: namespace.clone(),
+                token: token.clone(),
+                period_id: 0,
+                _reserved: 0,
+            },
+            EventIndexTopicV3 {
+                version: INDEXER_EVENT_SCHEMA_VERSION,
+                event_type: symbol_short!("fee_set"),
+                issuer: issuer.clone(),
+                namespace: namespace.clone(),
+                token: token.clone(),
+                period_id: 0,
+                _reserved: 0,
+            },
+            EventIndexTopicV3 {
+                version: INDEXER_EVENT_SCHEMA_VERSION,
+                event_type: symbol_short!("fee_ast"),
+                issuer: issuer.clone(),
+                namespace: namespace.clone(),
+                token: token.clone(),
+                period_id: 0,
+                _reserved: 0,
+            },
+            EventIndexTopicV3 {
+                version: INDEXER_EVENT_SCHEMA_VERSION,
+                event_type: symbol_short!("fee_off"),
+                issuer: issuer.clone(),
+                namespace: namespace.clone(),
+                token: token.clone(),
+                period_id: 0,
+                _reserved: 0,
+            },
+            EventIndexTopicV3 {
+                version: INDEXER_EVENT_SCHEMA_VERSION,
+                event_type: symbol_short!("conc_lim"),
+                issuer: issuer.clone(),
+                namespace: namespace.clone(),
+                token: token.clone(),
+                period_id: 0,
+                _reserved: 0,
+            },
+            EventIndexTopicV3 {
+                version: INDEXER_EVENT_SCHEMA_VERSION,
+                event_type: symbol_short!("rnd_mode"),
+                issuer: issuer.clone(),
+                namespace: namespace.clone(),
+                token: token.clone(),
+                period_id: 0,
+                _reserved: 0,
+            },
+            EventIndexTopicV3 {
+                version: INDEXER_EVENT_SCHEMA_VERSION,
+                event_type: symbol_short!("meta_key"),
+                issuer: issuer.clone(),
+                namespace: namespace.clone(),
+                token: token.clone(),
+                period_id: 0,
+                _reserved: 0,
+            },
+            EventIndexTopicV3 {
+                version: INDEXER_EVENT_SCHEMA_VERSION,
+                event_type: symbol_short!("meta_del"),
+                issuer: issuer.clone(),
+                namespace: namespace.clone(),
+                token: token.clone(),
+                period_id: 0,
+                _reserved: 0,
+            },
+            EventIndexTopicV3 {
+                version: INDEXER_EVENT_SCHEMA_VERSION,
+                event_type: symbol_short!("ms_init"),
+                issuer: issuer.clone(),
+                namespace: namespace.clone(),
+                token: token.clone(),
+                period_id: 0,
+                _reserved: 0,
+            },
+            // ── Regulatory-limit delta (reg_limit_delta event stream) ──
+            EventIndexTopicV3 {
+                version: INDEXER_EVENT_SCHEMA_VERSION,
+                event_type: symbol_short!("rg_lim_d"),
+                issuer: issuer.clone(),
+                namespace,
+                token,
+                period_id: 0,
+                _reserved: 0,
+            },
+        ];
 
-    let v3_fixtures: Vec<EventIndexTopicV3> = soroban_sdk::vec![
-        &env,
-        EventIndexTopicV3 {
-            version: INDEXER_EVENT_SCHEMA_VERSION,
-            event_type: symbol_short!("offer"),
-            issuer: issuer.clone(),
-            namespace: namespace.clone(),
-            token: token.clone(),
-            period_id: 0,
-            _reserved: 0,
-        },
-        EventIndexTopicV3 {
-            version: INDEXER_EVENT_SCHEMA_VERSION,
-            event_type: symbol_short!("rv_init"),
-            issuer: issuer.clone(),
-            namespace: namespace.clone(),
-            token: token.clone(),
-            period_id,
-            _reserved: 0,
-        },
-        EventIndexTopicV3 {
-            version: INDEXER_EVENT_SCHEMA_VERSION,
-            event_type: symbol_short!("rv_ovr"),
-            issuer: issuer.clone(),
-            namespace: namespace.clone(),
-            token: token.clone(),
-            period_id,
-            _reserved: 0,
-        },
-        EventIndexTopicV3 {
-            version: INDEXER_EVENT_SCHEMA_VERSION,
-            event_type: symbol_short!("rv_rej"),
-            issuer: issuer.clone(),
-            namespace: namespace.clone(),
-            token: token.clone(),
-            period_id,
-            _reserved: 0,
-        },
-        EventIndexTopicV3 {
-            version: INDEXER_EVENT_SCHEMA_VERSION,
-            event_type: symbol_short!("rv_rep"),
-            issuer: issuer.clone(),
-            namespace: namespace.clone(),
-            token: token.clone(),
-            period_id,
-            _reserved: 0,
-        },
-        EventIndexTopicV3 {
-            version: INDEXER_EVENT_SCHEMA_VERSION,
-            event_type: symbol_short!("claim"),
-            issuer: issuer.clone(),
-            namespace: namespace.clone(),
-            token: token.clone(),
-            period_id: 0,
-            _reserved: 0,
-        },
-        EventIndexTopicV3 {
-            version: INDEXER_EVENT_SCHEMA_VERSION,
-            event_type: symbol_short!("admin_set"),
-            issuer: issuer.clone(),
-            namespace: namespace.clone(),
-            token: token.clone(),
-            period_id: 0,
-            _reserved: 0,
-        },
-        EventIndexTopicV3 {
-            version: INDEXER_EVENT_SCHEMA_VERSION,
-            event_type: symbol_short!("fee_set"),
-            issuer: issuer.clone(),
-            namespace: namespace.clone(),
-            token: token.clone(),
-            period_id: 0,
-            _reserved: 0,
-        },
-        EventIndexTopicV3 {
-            version: INDEXER_EVENT_SCHEMA_VERSION,
-            event_type: symbol_short!("fee_ast"),
-            issuer: issuer.clone(),
-            namespace: namespace.clone(),
-            token: token.clone(),
-            period_id: 0,
-            _reserved: 0,
-        },
-        EventIndexTopicV3 {
-            version: INDEXER_EVENT_SCHEMA_VERSION,
-            event_type: symbol_short!("fee_off"),
-            issuer: issuer.clone(),
-            namespace: namespace.clone(),
-            token: token.clone(),
-            period_id: 0,
-            _reserved: 0,
-        },
-        EventIndexTopicV3 {
-            version: INDEXER_EVENT_SCHEMA_VERSION,
-            event_type: symbol_short!("conc_lim"),
-            issuer: issuer.clone(),
-            namespace: namespace.clone(),
-            token: token.clone(),
-            period_id: 0,
-            _reserved: 0,
-        },
-        EventIndexTopicV3 {
-            version: INDEXER_EVENT_SCHEMA_VERSION,
-            event_type: symbol_short!("rnd_mode"),
-            issuer: issuer.clone(),
-            namespace: namespace.clone(),
-            token: token.clone(),
-            period_id: 0,
-            _reserved: 0,
-        },
-        EventIndexTopicV3 {
-            version: INDEXER_EVENT_SCHEMA_VERSION,
-            event_type: symbol_short!("meta_key"),
-            issuer: issuer.clone(),
-            namespace: namespace.clone(),
-            token: token.clone(),
-            period_id: 0,
-            _reserved: 0,
-        },
-        EventIndexTopicV3 {
-            version: INDEXER_EVENT_SCHEMA_VERSION,
-            event_type: symbol_short!("meta_del"),
-            issuer: issuer.clone(),
-            namespace: namespace.clone(),
-            token: token.clone(),
-            period_id: 0,
-            _reserved: 0,
-        },
-        EventIndexTopicV3 {
-            version: INDEXER_EVENT_SCHEMA_VERSION,
-            event_type: symbol_short!("ms_init"),
-            issuer: issuer.clone(),
-            namespace: namespace.clone(),
-            token: token.clone(),
-            period_id: 0,
-            _reserved: 0,
-        },
-        // ── Regulatory-limit delta (reg_limit_delta event stream) ──
-        EventIndexTopicV3 {
-            version: INDEXER_EVENT_SCHEMA_VERSION,
-            event_type: symbol_short!("rg_lim_d"),
-            issuer: issuer.clone(),
-            namespace,
-            token,
-            period_id: 0,
-            _reserved: 0,
-        },
-    ];
-
-    (v2_fixtures, v3_fixtures)
-}
+        (v2_fixtures, v3_fixtures)
+    }
 }
 
 #[cfg(test)]
@@ -15756,12 +15988,12 @@ mod test_close_period;
 #[cfg(test)]
 mod test_deferred_priority;
 #[cfg(test)]
+mod test_merkle_proof_depth;
+#[cfg(test)]
+mod test_merkle_root_rotation;
+#[cfg(test)]
 mod test_merkle_root_rotation;
 #[cfg(test)]
 mod test_snapshot_voting_weight;
 #[cfg(test)]
 mod test_storage_layout_version;
-#[cfg(test)]
-mod test_merkle_root_rotation;
-#[cfg(test)]
-mod test_merkle_proof_depth;
