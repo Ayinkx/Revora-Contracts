@@ -63,12 +63,13 @@ fn set_redemption_window_ok() {
     let (client, issuer, offering_token, ..) = setup_offering(&env);
 
     set_timestamp(&env, 1000);
-    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000);
+    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000, &0);
 
     let window =
         client.get_redemption_window(&issuer, &symbol_short!("def"), &offering_token).unwrap();
     assert_eq!(window.start_timestamp, 500);
     assert_eq!(window.end_timestamp, 2000);
+    assert_eq!(window.per_holder_redemption_cap, 0);
 }
 
 #[test]
@@ -83,6 +84,7 @@ fn set_redemption_window_rejects_non_issuer() {
         &offering_token,
         &500,
         &2000,
+        &0,
     );
     assert_eq!(result, Err(Ok(RevoraError::OfferingNotFound)));
 }
@@ -98,6 +100,7 @@ fn set_redemption_window_rejects_bad_range() {
         &offering_token,
         &2000,
         &500,
+        &0,
     );
     assert_eq!(result, Err(Ok(RevoraError::LimitReached)));
 }
@@ -119,7 +122,7 @@ fn set_redemption_window_rejects_overlap() {
     let (client, issuer, offering_token, ..) = setup_offering(&env);
 
     // Set first window [500, 2000)
-    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000);
+    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000, &0);
 
     // Overlap from the left: [100, 1000) collides with [500, 2000)
     let result = client.try_set_redemption_window(
@@ -128,6 +131,7 @@ fn set_redemption_window_rejects_overlap() {
         &offering_token,
         &100,
         &1000,
+        &0,
     );
     assert_eq!(result, Err(Ok(RevoraError::RedemptionWindowOverlap)));
 
@@ -138,6 +142,7 @@ fn set_redemption_window_rejects_overlap() {
         &offering_token,
         &1500,
         &3000,
+        &0,
     );
     assert_eq!(result, Err(Ok(RevoraError::RedemptionWindowOverlap)));
 
@@ -148,6 +153,7 @@ fn set_redemption_window_rejects_overlap() {
         &offering_token,
         &600,
         &1800,
+        &0,
     );
     assert_eq!(result, Err(Ok(RevoraError::RedemptionWindowOverlap)));
 
@@ -158,6 +164,7 @@ fn set_redemption_window_rejects_overlap() {
         &offering_token,
         &100,
         &3000,
+        &0,
     );
     assert_eq!(result, Err(Ok(RevoraError::RedemptionWindowOverlap)));
 }
@@ -168,7 +175,7 @@ fn set_redemption_window_allows_contiguous_non_overlapping() {
     let (client, issuer, offering_token, ..) = setup_offering(&env);
 
     // Set first window [500, 2000)
-    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000);
+    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000, &0);
 
     // Non-overlapping: [2000, 3000) -- exactly adjacent (end == start)
     let result = client.try_set_redemption_window(
@@ -177,6 +184,7 @@ fn set_redemption_window_allows_contiguous_non_overlapping() {
         &offering_token,
         &2000,
         &3000,
+        &0,
     );
     assert_eq!(result, Ok(Ok(())));
 
@@ -184,6 +192,7 @@ fn set_redemption_window_allows_contiguous_non_overlapping() {
     let window = client.get_redemption_window(&issuer, &symbol_short!("def"), &offering_token).unwrap();
     assert_eq!(window.start_timestamp, 2000);
     assert_eq!(window.end_timestamp, 3000);
+    assert_eq!(window.per_holder_redemption_cap, 0);
 }
 
 // ── request_redemption ────────────────────────────────────────────────────────
@@ -194,7 +203,7 @@ fn request_redemption_ok() {
     let (client, issuer, offering_token, _, holder, ..) = setup_offering(&env);
 
     set_timestamp(&env, 1000);
-    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000);
+    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000, &0);
 
     let result = client.try_request_redemption(
         &holder,
@@ -212,7 +221,7 @@ fn request_redemption_outside_window() {
     let (client, issuer, offering_token, _, holder, ..) = setup_offering(&env);
 
     set_timestamp(&env, 3000);
-    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000);
+    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000, &0);
 
     let result = client.try_request_redemption(
         &holder,
@@ -246,7 +255,7 @@ fn request_redemption_blacklisted() {
     let (client, issuer, offering_token, _, holder, ..) = setup_offering(&env);
 
     set_timestamp(&env, 1000);
-    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000);
+    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000, &0);
     client.blacklist_add(&issuer, &issuer, &symbol_short!("def"), &offering_token, &holder);
 
     let result = client.try_request_redemption(
@@ -265,7 +274,7 @@ fn request_redemption_zero_shares() {
     let (client, issuer, offering_token, _, holder, ..) = setup_offering(&env);
 
     set_timestamp(&env, 1000);
-    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000);
+    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000, &0);
 
     let result =
         client.try_request_redemption(&holder, &issuer, &symbol_short!("def"), &offering_token, &0);
@@ -278,7 +287,7 @@ fn request_redemption_exceeds_share() {
     let (client, issuer, offering_token, _, holder, ..) = setup_offering(&env);
 
     set_timestamp(&env, 1000);
-    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000);
+    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000, &0);
 
     let result = client.try_request_redemption(
         &holder,
@@ -297,7 +306,7 @@ fn request_redemption_no_share() {
     let no_share_holder = Address::generate(&env);
 
     set_timestamp(&env, 1000);
-    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000);
+    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000, &0);
 
     let result = client.try_request_redemption(
         &no_share_holder,
@@ -315,7 +324,7 @@ fn request_redemption_duplicate() {
     let (client, issuer, offering_token, _, holder, ..) = setup_offering(&env);
 
     set_timestamp(&env, 1000);
-    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000);
+    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000, &0);
 
     // First request succeeds
     client.request_redemption(&holder, &issuer, &symbol_short!("def"), &offering_token, &2_000);
@@ -360,7 +369,7 @@ fn fulfill_redemption_ok() {
     let (client, issuer, offering_token, payment_token, holder, ..) = setup_offering(&env);
 
     set_timestamp(&env, 1000);
-    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000);
+    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000, &0);
     client.request_redemption(&holder, &issuer, &symbol_short!("def"), &offering_token, &2_000);
 
     let balance_before = token::Client::new(&env, &payment_token).balance(&holder);
@@ -386,7 +395,7 @@ fn fulfill_redemption_blacklisted() {
     let (client, issuer, offering_token, _, holder, ..) = setup_offering(&env);
 
     set_timestamp(&env, 1000);
-    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000);
+    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000, &0);
     client.request_redemption(&holder, &issuer, &symbol_short!("def"), &offering_token, &2_000);
 
     // Blacklist after request, before fulfill
@@ -408,7 +417,7 @@ fn fulfill_redemption_no_request() {
     let (client, issuer, offering_token, _, holder, ..) = setup_offering(&env);
 
     set_timestamp(&env, 1000);
-    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000);
+    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000, &0);
 
     let result = client.try_fulfill_redemption(
         &issuer,
@@ -426,7 +435,7 @@ fn fulfill_redemption_outside_window() {
     let (client, issuer, offering_token, _, holder, ..) = setup_offering(&env);
 
     set_timestamp(&env, 1000);
-    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000);
+    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000, &0);
     client.request_redemption(&holder, &issuer, &symbol_short!("def"), &offering_token, &2_000);
 
     // Advance past window close
@@ -448,7 +457,7 @@ fn fulfill_redemption_zero_share() {
     let (client, issuer, offering_token, _, holder, ..) = setup_offering(&env);
 
     set_timestamp(&env, 1000);
-    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000);
+    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000, &0);
     client.request_redemption(&holder, &issuer, &symbol_short!("def"), &offering_token, &2_000);
 
     // Clear holder share before fulfill
@@ -470,7 +479,7 @@ fn fulfill_redemption_capped_to_current_share() {
     let (client, issuer, offering_token, payment_token, holder, ..) = setup_offering(&env);
 
     set_timestamp(&env, 1000);
-    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000);
+    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000, &0);
     // Request current share (5_000) in full
     client.request_redemption(&holder, &issuer, &symbol_short!("def"), &offering_token, &5_000);
 
@@ -497,7 +506,7 @@ fn fulfill_redemption_rejects_zero_amount() {
     let (client, issuer, offering_token, _, holder, ..) = setup_offering(&env);
 
     set_timestamp(&env, 1000);
-    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000);
+    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000, &0);
     client.request_redemption(&holder, &issuer, &symbol_short!("def"), &offering_token, &2_000);
 
     let result =
@@ -511,7 +520,7 @@ fn fulfill_redemption_full_flow_then_re_request() {
     let (client, issuer, offering_token, payment_token, holder, ..) = setup_offering(&env);
 
     set_timestamp(&env, 1000);
-    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &5000);
+    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &5000, &0);
 
     // Request 2_000 of 5_000 shares
     client.request_redemption(&holder, &issuer, &symbol_short!("def"), &offering_token, &2_000);
@@ -533,7 +542,7 @@ fn fulfill_redemption_non_issuer_rejected() {
     let stranger = Address::generate(&env);
 
     set_timestamp(&env, 1000);
-    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000);
+    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000, &0);
     client.request_redemption(&holder, &issuer, &symbol_short!("def"), &offering_token, &2_000);
 
     let result = client.try_fulfill_redemption(
@@ -580,7 +589,7 @@ fn redemption_events_emitted() {
     );
 
     set_timestamp(&env, 1000);
-    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000);
+    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000, &0);
 
     let before = env.events().all().len();
     client.request_redemption(&holder, &issuer, &symbol_short!("def"), &offering_token, &2_000);
@@ -596,7 +605,7 @@ fn redemption_inside_window_after_blacklisting_rejected() {
     let (client, issuer, offering_token, _, holder, ..) = setup_offering(&env);
 
     set_timestamp(&env, 1000);
-    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000);
+    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000, &0);
     client.request_redemption(&holder, &issuer, &symbol_short!("def"), &offering_token, &2_000);
 
     // Blacklist while request is pending
@@ -671,7 +680,7 @@ fn test_fulfill_redemption_routes_fee_to_treasury() {
     client.set_redemption_fee_bps(&issuer, &symbol_short!("def"), &offering_token, &1_000, &treasury);
 
     set_timestamp(&env, 1000);
-    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000);
+    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000, &0);
     client.request_redemption(&holder, &issuer, &symbol_short!("def"), &offering_token, &2_000);
 
     let payout_token = soroban_sdk::token::Client::new(&env, &payout_token_id);
@@ -701,7 +710,7 @@ fn test_fulfill_redemption_max_fee_5000_bps() {
     client.set_redemption_fee_bps(&issuer, &symbol_short!("def"), &offering_token, &5_000, &treasury);
 
     set_timestamp(&env, 1000);
-    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000);
+    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000, &0);
     client.request_redemption(&holder, &issuer, &symbol_short!("def"), &offering_token, &2_000);
 
     let payout_token = soroban_sdk::token::Client::new(&env, &payout_token_id);
@@ -907,4 +916,206 @@ fn test_extend_lockup_no_schedule_rejected() {
         &attestation,
     );
     assert_eq!(result, Err(Ok(RevoraError::InvalidAmount)));
+
+// ── Per-holder redemption cap (issue #554) ──────────────────────────────────
+
+#[test]
+fn set_redemption_window_with_cap_ok() {
+    let env = Env::default();
+    let (client, issuer, offering_token, ..) = setup_offering(&env);
+
+    set_timestamp(&env, 1000);
+    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000, &100_000);
+
+    let window =
+        client.get_redemption_window(&issuer, &symbol_short!("def"), &offering_token).unwrap();
+    assert_eq!(window.start_timestamp, 500);
+    assert_eq!(window.end_timestamp, 2000);
+    assert_eq!(window.per_holder_redemption_cap, 100_000);
+}
+
+#[test]
+fn fulfill_redemption_within_cap() {
+    let env = Env::default();
+    let (client, issuer, offering_token, payment_token, holder, ..) = setup_offering(&env);
+
+    set_timestamp(&env, 1000);
+    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000, &100_000);
+    client.request_redemption(&holder, &issuer, &symbol_short!("def"), &offering_token, &2_000);
+
+    let balance_before = token::Client::new(&env, &payment_token).balance(&holder);
+    let result = client.try_fulfill_redemption(
+        &issuer,
+        &symbol_short!("def"),
+        &offering_token,
+        &holder,
+        &50_000,
+    );
+    assert_eq!(result, Ok(Ok(50_000)));
+    let balance_after = token::Client::new(&env, &payment_token).balance(&holder);
+    assert_eq!(balance_after - balance_before, 50_000);
+}
+
+#[test]
+fn fulfill_redemption_at_cap() {
+    let env = Env::default();
+    let (client, issuer, offering_token, payment_token, holder, ..) = setup_offering(&env);
+
+    set_timestamp(&env, 1000);
+    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000, &100_000);
+    client.request_redemption(&holder, &issuer, &symbol_short!("def"), &offering_token, &2_000);
+
+    let balance_before = token::Client::new(&env, &payment_token).balance(&holder);
+    let result = client.try_fulfill_redemption(
+        &issuer,
+        &symbol_short!("def"),
+        &offering_token,
+        &holder,
+        &100_000,
+    );
+    assert_eq!(result, Ok(Ok(100_000)));
+    let balance_after = token::Client::new(&env, &payment_token).balance(&holder);
+    assert_eq!(balance_after - balance_before, 100_000);
+}
+
+#[test]
+fn fulfill_redemption_exceeds_cap_rejected() {
+    let env = Env::default();
+    let (client, issuer, offering_token, _, holder, ..) = setup_offering(&env);
+
+    set_timestamp(&env, 1000);
+    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000, &100_000);
+    client.request_redemption(&holder, &issuer, &symbol_short!("def"), &offering_token, &2_000);
+
+    let result = client.try_fulfill_redemption(
+        &issuer,
+        &symbol_short!("def"),
+        &offering_token,
+        &holder,
+        &150_000,
+    );
+    assert_eq!(result, Err(Ok(RevoraError::RedemptionCapExceeded)));
+}
+
+#[test]
+fn fulfill_redemption_cumulative_over_cap_rejected() {
+    let env = Env::default();
+    let (client, issuer, offering_token, payment_token, holder, ..) = setup_offering(&env);
+
+    set_timestamp(&env, 1000);
+    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000, &100_000);
+    // Request only part of holder's share so there's remaining after fulfillment
+    client.request_redemption(&holder, &issuer, &symbol_short!("def"), &offering_token, &2_000);
+
+    // First fulfillment at cap
+    client.fulfill_redemption(&issuer, &symbol_short!("def"), &offering_token, &holder, &100_000);
+
+    // Holder still has remaining shares
+    let share_left = client.get_holder_share(&issuer, &symbol_short!("def"), &offering_token, &holder);
+    assert!(share_left > 0);
+
+    // Request remaining shares and try to fulfill — should be rejected by cumulative cap
+    client.request_redemption(&holder, &issuer, &symbol_short!("def"), &offering_token, &share_left);
+
+    let result = client.try_fulfill_redemption(
+        &issuer,
+        &symbol_short!("def"),
+        &offering_token,
+        &holder,
+        &50_000,
+    );
+    assert_eq!(result, Err(Ok(RevoraError::RedemptionCapExceeded)));
+}
+
+#[test]
+fn fulfill_redemption_cap_resets_in_new_window() {
+    let env = Env::default();
+    let (client, issuer, offering_token, payment_token, holder, ..) = setup_offering(&env);
+
+    set_timestamp(&env, 1000);
+    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000, &100_000);
+    client.request_redemption(&holder, &issuer, &symbol_short!("def"), &offering_token, &2_000);
+    client.fulfill_redemption(&issuer, &symbol_short!("def"), &offering_token, &holder, &100_000);
+
+    // New window should reset the cap
+    set_timestamp(&env, 2500);
+    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &2000, &5000, &100_000);
+    client.request_redemption(&holder, &issuer, &symbol_short!("def"), &offering_token, &2_000);
+
+    let balance_before = token::Client::new(&env, &payment_token).balance(&holder);
+    let result = client.try_fulfill_redemption(
+        &issuer,
+        &symbol_short!("def"),
+        &offering_token,
+        &holder,
+        &100_000,
+    );
+    assert_eq!(result, Ok(Ok(100_000)));
+    let balance_after = token::Client::new(&env, &payment_token).balance(&holder);
+    assert_eq!(balance_after - balance_before, 100_000);
+}
+
+#[test]
+fn fulfill_redemption_zero_cap_allows_unlimited() {
+    let env = Env::default();
+    let (client, issuer, offering_token, payment_token, holder, ..) = setup_offering(&env);
+
+    set_timestamp(&env, 1000);
+    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000, &0);
+    client.request_redemption(&holder, &issuer, &symbol_short!("def"), &offering_token, &2_000);
+
+    let result = client.try_fulfill_redemption(
+        &issuer,
+        &symbol_short!("def"),
+        &offering_token,
+        &holder,
+        &1_000_000,
+    );
+    assert_eq!(result, Ok(Ok(1_000_000)));
+}
+
+#[test]
+fn fulfill_redemption_cap_honors_fee_in_net_amount() {
+    let env = Env::default();
+    let (client, issuer, offering_token, payout_token_id, holder, ..) = setup_offering(&env);
+    let treasury = Address::generate(&env);
+
+    // Set 10% fee and a cap of 100_000
+    client.set_redemption_fee_bps(&issuer, &symbol_short!("def"), &offering_token, &1_000, &treasury);
+
+    set_timestamp(&env, 1000);
+    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000, &100_000);
+    client.request_redemption(&holder, &issuer, &symbol_short!("def"), &offering_token, &2_000);
+
+    // Gross amount = 111_111 → net ≈ 100_000 (111_111 - 11_111), should be OK at cap
+    let payout_token = soroban_sdk::token::Client::new(&env, &payout_token_id);
+    let balance_before = payout_token.balance(&holder);
+    let result = client.try_fulfill_redemption(
+        &issuer,
+        &symbol_short!("def"),
+        &offering_token,
+        &holder,
+        &111_111,
+    );
+    assert!(result.is_ok());
+    assert!(payout_token.balance(&holder) > balance_before);
+
+    // Verify net amount respects the cap — treasury receives fee, holder receives net
+    let net_received = payout_token.balance(&holder) - balance_before;
+    assert!(net_received <= 100_000);
+    assert_eq!(net_received, 100_000);
+}
+
+#[test]
+fn set_redemption_window_cap_in_window_assertion() {
+    let env = Env::default();
+    let (client, issuer, offering_token, ..) = setup_offering(&env);
+
+    set_timestamp(&env, 1000);
+    client.set_redemption_window(&issuer, &symbol_short!("def"), &offering_token, &500, &2000, &250_000);
+
+    let window = client.get_redemption_window(&issuer, &symbol_short!("def"), &offering_token).unwrap();
+    assert_eq!(window.start_timestamp, 500);
+    assert_eq!(window.end_timestamp, 2000);
+    assert_eq!(window.per_holder_redemption_cap, 250_000);
 }

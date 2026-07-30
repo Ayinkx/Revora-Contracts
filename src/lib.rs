@@ -355,6 +355,8 @@ pub enum RevoraError {
     /// [`set_transfer_cooldown`]) has elapsed since the holder's last transfer.
     /// Wire value: 89. Stable since v1.
     TransferCooldownActive = 89,
+    /// Per-holder redemption amount would exceed the per-window cap.
+    RedemptionCapExceeded = 90,
 }
 
 pub mod tax_bucket;
@@ -1305,6 +1307,13 @@ pub struct MetaRevenueApprovalPayload {
 pub struct AccessWindow {
     pub start_timestamp: u64,
     pub end_timestamp: u64,
+    pub per_holder_redemption_cap: i128,
+}
+
+impl AccessWindow {
+    pub fn new(start_timestamp: u64, end_timestamp: u64) -> Self {
+        AccessWindow { start_timestamp, end_timestamp, per_holder_redemption_cap: 0 }
+    }
 }
 
 /// Per-holder pending redemption request.
@@ -1313,6 +1322,22 @@ pub struct AccessWindow {
 pub struct PendingRedemption {
     pub shares_bps: u32,
     pub timestamp: u64,
+}
+
+/// Tracks how much a holder has already redeemed within the current window.
+/// The `window_start` field acts as a discriminator: when a new window is set,
+/// old entries are treated as stale (amount treated as zero).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct HolderCumulativeRedeemed {
+    pub window_start: u64,
+    pub amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum CumulativeRedemptionKey {
+    CumulativeHolderRedeemed(OfferingId, Address),
 }
 
 #[contracttype]
@@ -9790,7 +9815,7 @@ impl RevoraRevenueShare {
             return Err(RevoraError::OfferingNotFound);
         }
         issuer.require_auth();
-        let window = AccessWindow { start_timestamp, end_timestamp };
+        let window = AccessWindow { start_timestamp, end_timestamp, per_holder_redemption_cap: 0 };
         Self::validate_window(&window)?;
         let offering_id = OfferingId {
             issuer: issuer.clone(),
@@ -9822,7 +9847,7 @@ impl RevoraRevenueShare {
             return Err(RevoraError::OfferingNotFound);
         }
         issuer.require_auth();
-        let window = AccessWindow { start_timestamp, end_timestamp };
+        let window = AccessWindow { start_timestamp, end_timestamp, per_holder_redemption_cap: 0 };
         Self::validate_window(&window)?;
         let offering_id = OfferingId {
             issuer: issuer.clone(),
@@ -9861,6 +9886,8 @@ impl RevoraRevenueShare {
 
     /// Configure the redemption window for an offering. If unset, always open.
     /// Rejects the request if a stored redemption window overlaps with the new one.
+    /// `per_holder_cap` limits how much a single holder can redeem within this window
+    /// (in payment token units). 0 means no cap.
     pub fn set_redemption_window(
         env: Env,
         issuer: Address,
@@ -9868,6 +9895,7 @@ impl RevoraRevenueShare {
         token: Address,
         start_timestamp: u64,
         end_timestamp: u64,
+        per_holder_cap: i128,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
         let current_issuer =
@@ -9877,7 +9905,11 @@ impl RevoraRevenueShare {
             return Err(RevoraError::OfferingNotFound);
         }
         issuer.require_auth();
-        let new_window = AccessWindow { start_timestamp, end_timestamp };
+        let new_window = AccessWindow {
+            start_timestamp,
+            end_timestamp,
+            per_holder_redemption_cap: per_holder_cap,
+        };
         Self::validate_window(&new_window)?;
         let offering_id = OfferingId {
             issuer: issuer.clone(),
@@ -9898,7 +9930,7 @@ impl RevoraRevenueShare {
         env.storage().persistent().set(&WindowDataKey::Redemption(offering_id), &new_window);
         env.events().publish(
             (EVENT_REDEMPTION_WINDOW_SET, issuer, namespace, token),
-            (start_timestamp, end_timestamp),
+            (start_timestamp, end_timestamp, per_holder_cap),
         );
         Ok(())
     }
@@ -10370,7 +10402,7 @@ impl RevoraRevenueShare {
 
         Self::require_not_frozen(&env)?;
         issuer.require_auth();
-        let window = AccessWindow { start_timestamp, end_timestamp };
+        let window = AccessWindow { start_timestamp, end_timestamp, per_holder_redemption_cap: 0 };
         Self::validate_window(&window)?;
         let offering_id = OfferingId {
             issuer: issuer.clone(),
@@ -12086,6 +12118,40 @@ impl RevoraRevenueShare {
         } else {
             (amount, 0i128, None)
         };
+
+        // Check per-holder redemption cap (issue #554)
+        let window_key = WindowDataKey::Redemption(offering_id.clone());
+        if let Some(window) =
+            env.storage().persistent().get::<WindowDataKey, AccessWindow>(&window_key)
+        {
+            let cap = window.per_holder_redemption_cap;
+            if cap > 0 {
+                let cumulative_key = CumulativeRedemptionKey::CumulativeHolderRedeemed(
+                    offering_id.clone(),
+                    holder.clone(),
+                );
+                let mut cumulative: HolderCumulativeRedeemed =
+                    env.storage().persistent().get(&cumulative_key).unwrap_or(
+                        HolderCumulativeRedeemed {
+                            window_start: window.start_timestamp,
+                            amount: 0,
+                        },
+                    );
+                // If window changed, reset cumulative
+                if cumulative.window_start != window.start_timestamp {
+                    cumulative = HolderCumulativeRedeemed {
+                        window_start: window.start_timestamp,
+                        amount: 0,
+                    };
+                }
+                let new_total = cumulative.amount.checked_add(net_amount).unwrap_or(i128::MAX);
+                if new_total > cap {
+                    return Err(RevoraError::RedemptionCapExceeded);
+                }
+                cumulative.amount = new_total;
+                env.storage().persistent().set(&cumulative_key, &cumulative);
+            }
+        }
 
         let token_client = token::Client::new(&env, &payment_token);
         if net_amount > 0
