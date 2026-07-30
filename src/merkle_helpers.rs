@@ -51,7 +51,8 @@
 //!    rejected with [`MerkleError::InvalidShareBps`] before any hashing is done.
 //! 5. **Input size** — callers are responsible for bounding the input length.  The
 //!    helpers do not enforce a maximum; the contract entry points that call them enforce
-//!    `MAX_SNAPSHOT_BATCH` (50) per call.
+//!    `MAX_SNAPSHOT_BATCH` (50) per call and the snapshot-proof verifier enforces
+//!    `MAX_PROOF_DEPTH` (32) for proof verification.
 
 #![allow(dead_code)]
 
