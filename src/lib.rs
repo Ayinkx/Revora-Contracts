@@ -410,6 +410,8 @@ mod test_reg_limit_delta;
 #[cfg(test)]
 mod test_accrual_reconciliation_prop;
 #[cfg(test)]
+mod test_tax_year;
+#[cfg(test)]
 mod test_transfer_cooldown;
 
 // â”€â”€ Event symbols â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -1628,8 +1630,15 @@ pub enum DataKey2 {
     /// Per-entry faucet seed for testnet holder seeding.
     FaucetSeedEntry(OfferingId, u32),
     /// Running count of faucet seed slots generated for an offering; used by faucet_reset
-    /// to know how many FaucetSeedEntry keys to clear without unbounded iteration.
     FaucetSeedCount(OfferingId),
+
+    /// Per-offering fiscal year start month (1-12, default 1 = January).
+    /// Used by `get_holder_tax_year` to determine which fiscal year a payout
+    /// timestamp belongs to.
+    FiscalYearStartMonth(OfferingId),
+    /// Per-holder, per-fiscal-year accumulated tax summary.
+    /// Updated on every claim via `rollover_distribution`.
+    TaxYearEntry(OfferingId, Address, u64),
 
     // ── Multisig keys ──
     /// Multisig approval threshold.
@@ -9977,7 +9986,7 @@ impl RevoraRevenueShare {
         }
 
         if total_payout > 0 {
-            crate::tax_bucket::rollover_distribution(
+            let bucket = crate::tax_bucket::rollover_distribution(
                 &env,
                 &offering_id,
                 &holder,
@@ -9985,6 +9994,22 @@ impl RevoraRevenueShare {
                 previous_period_id
                     .expect("rollover_distribution called with zero claimed periods; total_payout > 0 invariant broken"),
                 now,
+            );
+            // Update the per-fiscal-year tax accumulator for year-end queries.
+            let fiscal_start_month = env
+                .storage()
+                .persistent()
+                .get::<_, u32>(&DataKey2::FiscalYearStartMonth(offering_id.clone()))
+                .unwrap_or(crate::tax_bucket::DEFAULT_FISCAL_START_MONTH);
+            let fy = crate::tax_bucket::fiscal_year_from_ts(now, fiscal_start_month);
+            crate::tax_bucket::update_tax_year_accumulator(
+                &env,
+                &offering_id,
+                &holder,
+                fy,
+                0, // ordinary_income — reserved; currently always 0
+                bucket.capital_gains,
+                bucket.return_of_capital,
             );
         }
 
@@ -12359,7 +12384,84 @@ impl RevoraRevenueShare {
         total
     }
 
-    // â”€â”€ Time-delayed claim configuration (#27) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ââ Fiscal year configuration âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+
+    /// Set the fiscal year start month for an offering.
+    ///
+    /// `month` must be 1 (January) through 12 (December).  The default is 1.
+    /// This determines how `get_holder_tax_year` maps payout timestamps to
+    /// fiscal years.
+    ///
+    /// # Access
+    /// Issuer-only (requires `require_issuer_quorum_auth`).
+    pub fn set_fiscal_year_start(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        month: u32,
+    ) -> Result<(), RevoraError> {
+        if month < 1 || month > 12 {
+            return Err(RevoraError::InvalidAmount);
+        }
+        let offering =
+            Self::get_offering(env.clone(), issuer.clone(), namespace.clone(), token.clone())
+                .ok_or(RevoraError::OfferingNotFound)?;
+        Self::require_issuer_quorum_auth(&env, &offering.issuers);
+
+        let offering_id = OfferingId { issuer, namespace, token };
+        env.storage().persistent().set(&DataKey2::FiscalYearStartMonth(offering_id), &month);
+        Ok(())
+    }
+
+    /// Read the fiscal year start month for an offering.
+    /// Returns 1 (January) if not configured.
+    pub fn get_fiscal_year_start(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+    ) -> u32 {
+        let offering_id = OfferingId { issuer, namespace, token };
+        env.storage()
+            .persistent()
+            .get::<_, u32>(&DataKey2::FiscalYearStartMonth(offering_id))
+            .unwrap_or(crate::tax_bucket::DEFAULT_FISCAL_START_MONTH)
+    }
+
+    /// Return the per-holder tax-year summary for a given fiscal year.
+    ///
+    /// The summary is accumulated on every `claim` and stored per offering,
+    /// per holder, per fiscal year.  Returns a `TaxYearSummary` with
+    /// `return_of_capital` and `capital_gains` totals for the requested year.
+    ///
+    /// The fiscal year is determined by the offering's configured fiscal year
+    /// start month (see `set_fiscal_year_start`).  If the start month is
+    /// April (4), then fiscal year 2024 covers Apr 2024 â Mar 2025.
+    ///
+    /// # Returns
+    /// A `TaxYearSummary` â never fails; returns zero-filled record for holders
+    /// with no activity in the given year.
+    pub fn get_holder_tax_year(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        holder: Address,
+        year: u64,
+    ) -> crate::tax_bucket::TaxYearSummary {
+        let offering_id = OfferingId { issuer, namespace, token };
+        env.storage()
+            .persistent()
+            .get(&DataKey2::TaxYearEntry(offering_id, holder, year))
+            .unwrap_or(crate::tax_bucket::TaxYearSummary {
+                ordinary_income: 0,
+                capital_gains: 0,
+                return_of_capital: 0,
+            })
+    }
+
+    // ââ Time-delayed claim configuration (#27) âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
     /// Set the claim delay for an offering in seconds.
     fn set_claim_delay_full(
