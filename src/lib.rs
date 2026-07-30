@@ -458,6 +458,7 @@ const EVENT_FREEZE_REASON_V1: Symbol = symbol_short!("frz_rsn");
 const EVENT_CLAIM_DELAY_SET_V2: Symbol = symbol_short!("dly_set2");
 const EVENT_CONCENTRATION_WARNING_V2: Symbol = symbol_short!("conc2");
 const EVENT_DECIMAL_SET: Symbol = symbol_short!("pt_dec");
+const EVENT_SUPPLY_CAP_SATURATED: Symbol = symbol_short!("cap_sat");
 
 const EVENT_PROPOSAL_CREATED_V2: Symbol = symbol_short!("prop_n2");
 const EVENT_PROPOSAL_APPROVED_V2: Symbol = symbol_short!("prop_a2");
@@ -2478,6 +2479,12 @@ impl RevoraRevenueShare {
                 .saturating_add(share_bps as i128);
             if new_total_shares > max_shares {
                 return Err(RevoraError::MaxTotalSupplySharesExceeded);
+            }
+            if new_total_shares == max_shares {
+                env.events().publish(
+                    (EVENT_SUPPLY_CAP_SATURATED, issuer.clone(), namespace.clone(), token.clone()),
+                    (new_total_shares, max_shares),
+                );
             }
         }
 
@@ -8844,6 +8851,12 @@ impl RevoraRevenueShare {
             }
             if temp_total_shares > max_shares {
                 return Err(RevoraError::MaxTotalSupplySharesExceeded);
+            }
+            if temp_total_shares == max_shares {
+                env.events().publish(
+                    (EVENT_SUPPLY_CAP_SATURATED, offering_id.issuer.clone(), offering_id.namespace.clone(), offering_id.token.clone()),
+                    (temp_total_shares, max_shares),
+                );
             }
         }
 
