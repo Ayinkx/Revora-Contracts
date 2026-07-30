@@ -542,6 +542,8 @@ const EVENT_ROYALTY_CONFIG: Symbol = symbol_short!("roy_cfg");
 const EVENT_ROYALTY_PAID: Symbol = symbol_short!("roy_paid");
 const EVENT_INDEXED_V2: Symbol = symbol_short!("ev_idx2");
 const EVENT_INDEXED_V3: Symbol = symbol_short!("ev_idx3");
+pub const EVENT_PROOF_REJECT_DEPTH: Symbol = symbol_short!("proof_reject_depth");
+pub const MAX_PROOF_DEPTH: u32 = 32;
 const EVENT_TYPE_OFFER: Symbol = symbol_short!("offer");
 /// Emitted when a period is sealed by `close_period`.
 const EVENT_PERIOD_CLOSED: Symbol = symbol_short!("per_clos");
@@ -8953,6 +8955,41 @@ impl RevoraRevenueShare {
             (EVENT_SNAP_SHARES_APPLIED, issuer, namespace, token),
             (snapshot_ref, start_index, batch_len, new_total_bps),
         );
+        Ok(())
+    }
+
+    /// Verify a snapshot proof while enforcing the maximum depth permitted by the
+    /// contract. Deep proofs can exhaust contract memory and gas, so the contract
+    /// rejects them early with [`RevoraError::ProofTooDeep`] and emits
+    /// [`EVENT_PROOF_REJECT_DEPTH`] when the bound is violated.
+    ///
+    /// The implementation is intentionally lightweight: it only validates the proof
+    /// length and returns `Ok(())` for proofs that fit within the hard limit.
+    /// Off-chain callers remain responsible for the actual proof verification and
+    /// root comparison logic.
+    pub fn verify_snapshot_proof(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        snapshot_ref: u64,
+        proof: Vec<BytesN<32>>,
+    ) -> Result<(), RevoraError> {
+        let proof_len = proof.len();
+        if proof_len > MAX_PROOF_DEPTH {
+            env.events().publish(
+                (
+                    EVENT_PROOF_REJECT_DEPTH,
+                    issuer.clone(),
+                    namespace.clone(),
+                    token.clone(),
+                    snapshot_ref,
+                ),
+                (proof_len, MAX_PROOF_DEPTH),
+            );
+            return Err(RevoraError::ProofTooDeep);
+        }
+
         Ok(())
     }
 
