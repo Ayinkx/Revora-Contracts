@@ -116,6 +116,11 @@ pub enum MerkleError {
     ProofTooDeep = 1003,
 }
 
+/// Maximum number of sibling hashes accepted in a Merkle proof.
+///
+/// Proofs longer than this are rejected with [`MerkleError::ProofTooDeep`].
+pub const MAX_PROOF_DEPTH: u32 = 32;
+
 // ── Public helpers ──────────────────────────────────────────────────────────
 
 /// One entry in a canonical Merkle-leaf sequence.

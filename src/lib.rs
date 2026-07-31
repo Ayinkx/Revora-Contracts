@@ -391,9 +391,9 @@ mod test_time_windows;
 // #[cfg(test)]
 // mod test_claim_transfer_fail;
 #[cfg(test)]
-mod test_close_period;
+mod test_accrual_reconciliation_prop;
 #[cfg(test)]
-mod test_compute_share_decomposition_prop;
+mod test_close_period;
 #[cfg(test)]
 mod test_compute_share_decomposition_prop;
 #[cfg(test)]
@@ -407,8 +407,6 @@ mod test_faucet_seed;
 mod test_quorum_check;
 #[cfg(test)]
 mod test_reg_limit_delta;
-#[cfg(test)]
-mod test_accrual_reconciliation_prop;
 #[cfg(test)]
 mod test_tax_year;
 #[cfg(test)]
@@ -547,8 +545,7 @@ const EVENT_ROYALTY_CONFIG: Symbol = symbol_short!("roy_cfg");
 const EVENT_ROYALTY_PAID: Symbol = symbol_short!("roy_paid");
 const EVENT_INDEXED_V2: Symbol = symbol_short!("ev_idx2");
 const EVENT_INDEXED_V3: Symbol = symbol_short!("ev_idx3");
-pub const EVENT_PROOF_REJECT_DEPTH: Symbol = symbol_short!("proof_reject_depth");
-pub const MAX_PROOF_DEPTH: u32 = 32;
+pub use crate::merkle_helpers::MAX_PROOF_DEPTH;
 const EVENT_TYPE_OFFER: Symbol = symbol_short!("offer");
 /// Emitted when a period is sealed by `close_period`.
 const EVENT_PERIOD_CLOSED: Symbol = symbol_short!("per_clos");
@@ -1514,7 +1511,7 @@ pub struct AccrualAnchor {
 /// Overflow enum to keep DataKey within the Soroban XDR union variant limit.
 #[contracttype]
 #[derive(Clone)]
-pub enum DataKey2 {
+pub(crate) enum DataKey2 {
     /// Whether the snapshot has been finalized successfully.
     SnapshotFinalized(OfferingId, u64),
     /// Per-offering supply cap (max total deposited revenue).
@@ -8932,7 +8929,12 @@ impl RevoraRevenueShare {
             }
             if temp_total_shares == max_shares {
                 env.events().publish(
-                    (EVENT_SUPPLY_CAP_SATURATED, offering_id.issuer.clone(), offering_id.namespace.clone(), offering_id.token.clone()),
+                    (
+                        EVENT_SUPPLY_CAP_SATURATED,
+                        offering_id.issuer.clone(),
+                        offering_id.namespace.clone(),
+                        offering_id.token.clone(),
+                    ),
                     (temp_total_shares, max_shares),
                 );
             }
@@ -10978,11 +10980,7 @@ impl RevoraRevenueShare {
         let mut payouts: Vec<DistributionEntry> = Vec::new(env);
         for (bounded_bps, share_bps, holder, normalized_payout) in payout_rows {
             let _ = bounded_bps;
-            payouts.push_back(DistributionEntry {
-                holder,
-                share_bps,
-                normalized_payout,
-            });
+            payouts.push_back(DistributionEntry { holder, share_bps, normalized_payout });
         }
 
         PreflightCloseResult {
@@ -16082,13 +16080,9 @@ impl RevoraRevenueShare {
 }
 
 #[cfg(test)]
-mod test_close_period;
-#[cfg(test)]
 mod test_deferred_priority;
 #[cfg(test)]
 mod test_merkle_proof_depth;
-#[cfg(test)]
-mod test_merkle_root_rotation;
 #[cfg(test)]
 mod test_merkle_root_rotation;
 #[cfg(test)]

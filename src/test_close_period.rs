@@ -71,19 +71,18 @@ fn setup_offering_with_contract_id(
 
     client.register_offering(
         &issuer,
+        &Vec::from_array(&env, []),
+        &1u32,
         &symbol_short!("ns"),
         &offering_token,
-        &10_000,
+        &10_000u32,
         &payment_token,
-        &0,
+        &0i128,
+        &symbol_short!(""),
+        &0u32,
     );
 
     (env, client, issuer, offering_token, payment_token, contract_id)
-}
-
-fn setup_offering() -> (Env, RevoraRevenueShareClient<'static>, Address, Address, Address) {
-    let (env, client, issuer, token, payment_token, _) = setup_offering_with_contract_id();
-    (env, client, issuer, token, payment_token)
 }
 
 proptest! {
